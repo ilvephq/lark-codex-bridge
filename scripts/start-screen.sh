@@ -12,7 +12,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-if screen -ls | grep -q "[.]$SCREEN_NAME[[:space:]]"; then
+if (screen -ls 2>/dev/null || true) | grep -q "[.]$SCREEN_NAME[[:space:]]"; then
   echo "Screen session already running: $SCREEN_NAME"
   exit 0
 fi

@@ -23,6 +23,7 @@ SYNC_RENDER_DEFAULT="${LARK_CODEX_SYNC_RENDER:-stream}"
 ENABLE_MESSAGE_UPDATE_DEFAULT="${LARK_CODEX_ENABLE_MESSAGE_UPDATE:-false}"
 STATE_DIR="${LARK_CODEX_STATE_DIR:-$BASE_DIR/state}"
 LOCK_DIR="$STATE_DIR/running.lock"
+RUNNING_LOCK_PID_FILE="$LOCK_DIR/pid"
 TASK_QUEUE_DIR="$STATE_DIR/queue"
 SYNC_INTERVAL_SECONDS="${LARK_CODEX_SYNC_INTERVAL_SECONDS:-60}"
 SESSION_STREAM_INTERVAL_SECONDS="${LARK_CODEX_SESSION_STREAM_INTERVAL_SECONDS:-8}"
@@ -622,6 +623,56 @@ queue_count() {
   find "$TASK_QUEUE_DIR" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '
 }
 
+mtime_epoch() {
+  local path="$1"
+  stat -f '%m' "$path" 2>/dev/null || stat -c '%Y' "$path" 2>/dev/null || echo 0
+}
+
+recover_stale_running_lock() {
+  local now mtime age stale_after pid lock_contents
+
+  [[ -d "$LOCK_DIR" ]] || return 0
+
+  if [[ -f "$RUNNING_LOCK_PID_FILE" ]]; then
+    pid=""
+    read -r pid <"$RUNNING_LOCK_PID_FILE" 2>/dev/null || true
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  now="$(date '+%s')"
+  mtime="$(mtime_epoch "$LOCK_DIR")"
+  [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+  ((mtime > 0)) || return 0
+
+  stale_after=$((CODEX_TASK_TIMEOUT_SECONDS + 120))
+  age=$((now - mtime))
+  ((age >= stale_after)) || return 0
+
+  rm -f "$RUNNING_LOCK_PID_FILE" 2>/dev/null || true
+  lock_contents="$(find "$LOCK_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
+  if [[ -z "$lock_contents" ]] && rmdir "$LOCK_DIR" 2>/dev/null; then
+    echo "$(timestamp) recovered stale running lock age=${age}s" >&2
+  fi
+}
+
+try_acquire_running_lock() {
+  recover_stale_running_lock
+  mkdir "$LOCK_DIR" 2>/dev/null
+}
+
+write_running_lock_pid() {
+  local pid="$1"
+  [[ -d "$LOCK_DIR" ]] || return 0
+  printf '%s\n' "$pid" >"$RUNNING_LOCK_PID_FILE" 2>/dev/null || true
+}
+
+clear_running_lock() {
+  rm -f "$RUNNING_LOCK_PID_FILE" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
 next_queue_file() {
   find "$TASK_QUEUE_DIR" -type f -name '*.json' 2>/dev/null | sort | head -n 1
 }
@@ -655,7 +706,7 @@ queue_watch_loop() {
   while true; do
     sleep 5
     [[ -n "$(next_queue_file)" ]] || continue
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
+    if try_acquire_running_lock; then
       pop_queue_task &
     fi
   done
@@ -1787,7 +1838,7 @@ start_new_session_task() {
   local task_id
 
   clear_new_session_pending
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if ! try_acquire_running_lock; then
     enqueue_task "$message_id" "$prompt" "" "new_session"
     return
   fi
@@ -1841,6 +1892,7 @@ run_codex_task() {
           -
     ) >>"$TASK_LOG_FILE" 2>&1 &
     codex_pid=$!
+    write_running_lock_pid "$codex_pid"
     if wait_with_timeout "$codex_pid"; then
       codex_exit=0
     else
@@ -1858,6 +1910,7 @@ run_codex_task() {
           -
     ) >>"$TASK_LOG_FILE" 2>&1 &
     codex_pid=$!
+    write_running_lock_pid "$codex_pid"
     if wait_with_timeout "$codex_pid"; then
       codex_exit=0
     else
@@ -1892,7 +1945,7 @@ run_codex_task() {
 
   rm -f "$output_file"
   pop_queue_task || true
-  rmdir "$LOCK_DIR" 2>/dev/null || true
+  clear_running_lock
 }
 
 echo "$(timestamp) Listening for Feishu messages from the allowed sender" >&2
@@ -2082,7 +2135,7 @@ while IFS= read -r line; do
   if [[ "$prompt" =~ ^(新任务|new)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     clear_new_session_pending
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    if ! try_acquire_running_lock; then
       enqueue_task "$message_id" "$prompt" "" "final"
       continue
     fi
@@ -2100,7 +2153,7 @@ while IFS= read -r line; do
 
   attached_session_id="$(active_session_id || true)"
   if [[ -n "$attached_session_id" ]]; then
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    if ! try_acquire_running_lock; then
       enqueue_task "$message_id" "$prompt" "$attached_session_id" "stream"
       continue
     fi
@@ -2111,7 +2164,7 @@ while IFS= read -r line; do
     continue
   fi
 
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if ! try_acquire_running_lock; then
     enqueue_task "$message_id" "$prompt" "" "final"
     continue
   fi

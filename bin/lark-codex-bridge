@@ -724,40 +724,29 @@ session_summary_text() {
 
 set_active_session() {
   local session_id="$1"
-  local seconds="${2:-}"
-  local title expires_at persistent
+  local title
 
   title="$(session_title "$session_id")"
-  if [[ -n "$seconds" && "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 ]]; then
-    expires_at=$(($(date '+%s') + seconds))
-    persistent=false
-  else
-    expires_at=0
-    persistent=true
-  fi
   jq -n \
     --arg session_id "$session_id" \
     --arg title "$title" \
     --arg started_at "$(timestamp)" \
-    --argjson expires_at "$expires_at" \
-    --argjson persistent "$persistent" \
+    --argjson expires_at 0 \
+    --argjson persistent true \
     '{session_id:$session_id,title:$title,started_at:$started_at,expires_at:$expires_at,persistent:$persistent}' \
     >"$ACTIVE_SESSION_FILE"
 }
 
 active_session_id() {
-  local now expires_at session_id
+  local session_id
 
   [[ -f "$ACTIVE_SESSION_FILE" ]] || return 1
-  now="$(date '+%s')"
-  expires_at="$(jq -r '.expires_at // 0' "$ACTIVE_SESSION_FILE" 2>/dev/null || printf '0')"
   session_id="$(jq -r '.session_id // empty' "$ACTIVE_SESSION_FILE" 2>/dev/null || true)"
-  if [[ -n "$session_id" && "$expires_at" =~ ^[0-9]+$ && ("$expires_at" == "0" || "$now" -lt "$expires_at") ]]; then
+  if [[ -n "$session_id" ]]; then
     printf '%s' "$session_id"
     return 0
   fi
 
-  rm -f "$ACTIVE_SESSION_FILE"
   return 1
 }
 

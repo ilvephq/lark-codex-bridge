@@ -1032,7 +1032,7 @@ sync_loop() {
   local message_id="$1"
   local seconds="$2"
   local session_id="${3:-}"
-  local started_at end_at state sleep_for last_lines current_lines session_file first_line current_active sync_expires delta
+  local started_at end_at state sleep_for last_lines current_lines session_file first_line current_active sync_expires delta label number
 
   started_at="$(date '+%s')"
   end_at=$((started_at + seconds))
@@ -1049,21 +1049,23 @@ sync_loop() {
 
   last_lines=0
 
-  if [[ -n "$session_id" ]]; then
-    set_active_session "$session_id"
-    session_file="$(find_session_file "$session_id")"
-    if [[ -n "$session_file" && -f "$session_file" ]]; then
-      current_lines="$(wc -l <"$session_file" | tr -d ' ')"
-      first_line=$((current_lines - 500))
-      if ((first_line < 1)); then
-        first_line=1
-      fi
-      reply "$message_id" "$(session_stream_text "$session_id" "$first_line" 24 true)" || true
-      last_lines="$current_lines"
-    else
-      reply "$message_id" "$(session_stream_text "$session_id" 1 24 true)" || true
-    fi
-  fi
+	  if [[ -n "$session_id" ]]; then
+	    set_active_session "$session_id"
+	    session_file="$(find_session_file "$session_id")"
+	    if [[ -n "$session_file" && -f "$session_file" ]]; then
+	      current_lines="$(wc -l <"$session_file" | tr -d ' ')"
+	      first_line=$((current_lines - 500))
+	      if ((first_line < 1)); then
+	        first_line=1
+	      fi
+	      delta="$(session_stream_text "$session_id" "$first_line" 24 false)"
+	      [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
+	      last_lines="$current_lines"
+	    else
+	      delta="$(session_stream_text "$session_id" 1 24 false)"
+	      [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
+	    fi
+	  fi
 
   while :; do
     if [[ -f "$SYNC_FILE" ]]; then
@@ -1091,10 +1093,18 @@ sync_loop() {
           fi
         else
           first_line=1
-        fi
-        last_lines="$current_lines"
-        reply "$message_id" '$ codex switch '"$session_id"$'\n'"$(session_stream_text "$session_id" "$first_line" 18 true)" || true
-      fi
+	      fi
+	      last_lines="$current_lines"
+	      label="$(session_title "$session_id")"
+	      number="$(session_alias_number "$session_id" || true)"
+	      [[ -n "$number" ]] && label="#$number $label"
+	      delta="$(session_stream_text "$session_id" "$first_line" 18 false)"
+	      if [[ -n "$delta" ]]; then
+	        reply "$message_id" "同步切换到: $label"$'\n\n'"$delta" || true
+	      else
+	        reply "$message_id" "同步切换到: $label" || true
+	      fi
+	    fi
 
       session_file="$(find_session_file "$session_id")"
       current_lines=0
@@ -1102,13 +1112,14 @@ sync_loop() {
       if ((last_lines > 0 && current_lines == last_lines)); then
         : # no-op; keep silent when no new events
       else
-        if ((last_lines > 0)); then
-          delta="$(session_stream_text "$session_id" $((last_lines + 1)) 30 false)"
-          [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
-        else
-          reply "$message_id" "$(session_stream_text "$session_id" 1 30 true)" || true
-        fi
-      fi
+	        if ((last_lines > 0)); then
+	          delta="$(session_stream_text "$session_id" $((last_lines + 1)) 30 false)"
+	          [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
+	        else
+	          delta="$(session_stream_text "$session_id" 1 30 false)"
+	          [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
+	        fi
+	      fi
       last_lines="$current_lines"
     else
       reply "$message_id" "$(sync_snapshot_text)" || true

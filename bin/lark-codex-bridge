@@ -1,0 +1,1174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_DIR="${LARK_CODEX_BASE_DIR:-$HOME/.lark-codex}"
+CRED_FILE="${LARK_CODEX_CREDENTIALS:-$BASE_DIR/.env}"
+CODEX_WORKDIR="${LARK_CODEX_WORKDIR:-$HOME}"
+COMMAND_PREFIX="${LARK_CODEX_COMMAND_PREFIX:-/codex}"
+ALLOWED_SENDER="${LARK_CODEX_ALLOWED_SENDER:-}"
+MAX_REPLY_CHARS="${LARK_CODEX_MAX_REPLY_CHARS:-12000}"
+LOG_FILE="${LARK_CODEX_LOG_FILE:-$BASE_DIR/bridge.log}"
+CODEX_MODEL="${LARK_CODEX_MODEL:-gpt-5.2}"
+CODEX_BIN="${LARK_CODEX_BIN:-codex}"
+CODEX_TASK_TIMEOUT_SECONDS="${LARK_CODEX_TASK_TIMEOUT_SECONDS:-900}"
+ACK_EMOJI="${LARK_CODEX_ACK_EMOJI:-👀}"
+STATE_DIR="${LARK_CODEX_STATE_DIR:-$BASE_DIR/state}"
+STATUS_FILE="$STATE_DIR/status.json"
+TASK_LOG_FILE="$STATE_DIR/current.log"
+LOCK_DIR="$STATE_DIR/running.lock"
+TASK_QUEUE_DIR="$STATE_DIR/queue"
+SYNC_FILE="$STATE_DIR/sync.json"
+SYNC_STOP_FILE="$STATE_DIR/sync.stop"
+SYNC_LOCK_DIR="$STATE_DIR/sync.lock"
+SYNC_INTERVAL_SECONDS="${LARK_CODEX_SYNC_INTERVAL_SECONDS:-60}"
+SESSION_STREAM_INTERVAL_SECONDS="${LARK_CODEX_SESSION_STREAM_INTERVAL_SECONDS:-8}"
+SYNC_MAX_SECONDS="${LARK_CODEX_SYNC_MAX_SECONDS:-3600}"
+CODEX_SESSIONS_ROOT="${LARK_CODEX_SESSIONS_ROOT:-$HOME/.codex/sessions}"
+CODEX_STATE_DB="${LARK_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
+LARK_CODEX_DANGEROUS_BYPASS="${LARK_CODEX_DANGEROUS_BYPASS:-false}"
+SESSION_ALIAS_FILE="$STATE_DIR/session_aliases.tsv"
+PINNED_SESSIONS_FILE="$STATE_DIR/pinned_sessions.txt"
+ACTIVE_SESSION_FILE="$STATE_DIR/active_session.json"
+
+timestamp() {
+  date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+if [[ ! -f "$CRED_FILE" ]]; then
+  echo "Missing credentials file: $CRED_FILE" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CRED_FILE"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$STATE_DIR"
+mkdir -p "$TASK_QUEUE_DIR"
+exec >>"$LOG_FILE" 2>&1
+
+: "${LARKSUITE_CLI_APP_ID:?Missing LARKSUITE_CLI_APP_ID}"
+: "${LARKSUITE_CLI_APP_SECRET:?Missing LARKSUITE_CLI_APP_SECRET}"
+if [[ -z "$ALLOWED_SENDER" ]]; then
+  echo "Missing LARK_CODEX_ALLOWED_SENDER. Set it to the Feishu/Lark open_id allowed to control Codex." >&2
+  exit 1
+fi
+export LARKSUITE_CLI_APP_ID LARKSUITE_CLI_APP_SECRET
+export FEISHU_APP_ID="${FEISHU_APP_ID:-$LARKSUITE_CLI_APP_ID}"
+export FEISHU_APP_SECRET="${FEISHU_APP_SECRET:-$LARKSUITE_CLI_APP_SECRET}"
+
+refresh_tenant_token() {
+  local response token
+
+  response="$(
+    jq -n \
+      --arg app_id "$LARKSUITE_CLI_APP_ID" \
+      --arg app_secret "$LARKSUITE_CLI_APP_SECRET" \
+      '{app_id:$app_id,app_secret:$app_secret}' |
+      curl -fsS \
+        -X POST \
+        -H 'Content-Type: application/json' \
+        -d @- \
+        https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal
+  )"
+
+  token="$(jq -r '.tenant_access_token // empty' <<<"$response")"
+  if [[ -z "$token" ]]; then
+    echo "Could not fetch Feishu tenant_access_token: $(jq -c '{code,msg}' <<<"$response")" >&2
+    return 1
+  fi
+
+  export LARKSUITE_CLI_TENANT_ACCESS_TOKEN="$token"
+}
+
+reply() {
+  local message_id="$1"
+  local text="$2"
+
+  if ((${#text} > MAX_REPLY_CHARS)); then
+    text="${text:0:MAX_REPLY_CHARS}"$'\n\n[output truncated]'
+  fi
+
+  refresh_tenant_token
+  lark-cli im +messages-reply \
+    --message-id "$message_id" \
+    --text "$text" \
+    --as bot >/dev/null </dev/null
+}
+
+final_reply_text() {
+  local answer="$1"
+
+  printf '✅ 完成\n\n%s' "$answer"
+}
+
+failed_reply_text() {
+  local detail="${1:-Codex failed while handling this request.}"
+
+  printf '❌ 失败\n\n%s\n\n发送 logs 查看最近日志。' "$detail"
+}
+
+set_status() {
+  local state="$1"
+  local task_id="$2"
+  local message_id="$3"
+  local prompt="$4"
+  local detail="${5:-}"
+
+  jq -n \
+    --arg state "$state" \
+    --arg task_id "$task_id" \
+    --arg message_id "$message_id" \
+    --arg prompt "$prompt" \
+    --arg detail "$detail" \
+    --arg updated_at "$(timestamp)" \
+    '{state:$state,task_id:$task_id,message_id:$message_id,prompt:$prompt,detail:$detail,updated_at:$updated_at}' \
+    >"$STATUS_FILE"
+}
+
+queue_count() {
+  find "$TASK_QUEUE_DIR" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '
+}
+
+next_queue_file() {
+  find "$TASK_QUEUE_DIR" -type f -name '*.json' 2>/dev/null | sort | head -n 1
+}
+
+pop_queue_task() {
+  local queue_file queued_json queued_task_id queued_message_id queued_prompt queued_session_id queued_reply_mode queued_title
+
+  queue_file="$(next_queue_file)"
+  [[ -n "$queue_file" && -f "$queue_file" ]] || return 1
+
+  queued_json="$(cat "$queue_file")"
+  rm -f "$queue_file"
+
+  queued_task_id="$(jq -r '.task_id // empty' <<<"$queued_json")"
+  queued_message_id="$(jq -r '.message_id // empty' <<<"$queued_json")"
+  queued_prompt="$(jq -r '.prompt // empty' <<<"$queued_json")"
+  queued_session_id="$(jq -r '.session_id // empty' <<<"$queued_json")"
+  queued_reply_mode="$(jq -r '.reply_mode // "final"' <<<"$queued_json")"
+
+  if [[ -z "$queued_task_id" || -z "$queued_message_id" || -z "$queued_prompt" ]]; then
+    return 1
+  fi
+
+  run_codex_task "$queued_task_id" "$queued_message_id" "$queued_prompt" "$queued_session_id" "$queued_reply_mode"
+}
+
+queue_watch_loop() {
+  while true; do
+    sleep 5
+    [[ -n "$(next_queue_file)" ]] || continue
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      pop_queue_task &
+    fi
+  done
+}
+
+terminate_pid_tree() {
+  local pid="$1"
+
+  pkill -TERM -P "$pid" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 2
+  pkill -KILL -P "$pid" 2>/dev/null || true
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+wait_with_timeout() {
+  local pid="$1"
+  local timeout="${2:-$CODEX_TASK_TIMEOUT_SECONDS}"
+  local started_at now
+
+  started_at="$(date '+%s')"
+  while kill -0 "$pid" 2>/dev/null; do
+    now="$(date '+%s')"
+    if ((now - started_at >= timeout)); then
+      echo "$(timestamp) task timed out after ${timeout}s; terminating pid=$pid" >>"$TASK_LOG_FILE"
+      terminate_pid_tree "$pid"
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 2
+  done
+
+  wait "$pid"
+}
+
+enqueue_task() {
+  local message_id="$1"
+  local prompt="$2"
+  local session_id="${3:-}"
+  local reply_mode="${4:-final}"
+  local task_id filename tmp count title
+
+  task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
+  filename="$TASK_QUEUE_DIR/$(perl -MTime::HiRes=time -e 'printf "%.6f", time' | tr -d .)-$$-$RANDOM.json"
+  tmp="$filename.tmp"
+  jq -n \
+    --arg task_id "$task_id" \
+    --arg message_id "$message_id" \
+    --arg prompt "$prompt" \
+    --arg session_id "$session_id" \
+    --arg reply_mode "$reply_mode" \
+    --arg queued_at "$(timestamp)" \
+    '{task_id:$task_id,message_id:$message_id,prompt:$prompt,session_id:$session_id,reply_mode:$reply_mode,queued_at:$queued_at}' \
+    >"$tmp"
+  mv "$tmp" "$filename"
+
+  count="$(queue_count)"
+  reply "$message_id" "$ACK_EMOJI"
+}
+
+queue_text() {
+  local count file index prompt session_id title queued_at
+
+  count="$(queue_count)"
+  if [[ "$count" == "0" ]]; then
+    printf '$ codex queue\nempty'
+    return
+  fi
+
+  printf '$ codex queue\n'
+  index=1
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    prompt="$(jq -r '.prompt // ""' "$file" | compact_text 80)"
+    session_id="$(jq -r '.session_id // empty' "$file")"
+    queued_at="$(jq -r '.queued_at // ""' "$file")"
+    if [[ -n "$session_id" ]]; then
+      title="$(session_title "$session_id")"
+      printf '[%s] %s -> %s\n    %s\n' "$index" "$queued_at" "$title" "$prompt"
+    else
+      printf '[%s] %s -> new task\n    %s\n' "$index" "$queued_at" "$prompt"
+    fi
+    index=$((index + 1))
+  done < <(find "$TASK_QUEUE_DIR" -type f -name '*.json' 2>/dev/null | sort)
+}
+
+status_text() {
+  local queued
+
+  if [[ ! -f "$STATUS_FILE" ]]; then
+    queued="$(queue_count)"
+    printf '还没有任务记录。直接发送要我处理的内容即可开始。\n队列: %s' "$queued"
+    return
+  fi
+
+  jq -r '
+    "状态: \(.state)\n任务: \(.task_id)\n时间: \(.updated_at)\n内容: \(.prompt)\n备注: \(.detail // "")"
+  ' "$STATUS_FILE"
+  queued="$(queue_count)"
+  printf '\n队列: %s' "$queued"
+}
+
+logs_text() {
+  if [[ ! -f "$TASK_LOG_FILE" ]]; then
+    printf '还没有任务日志。'
+    return
+  fi
+
+  tail -n 80 "$TASK_LOG_FILE" |
+    redact_log
+}
+
+redact_log() {
+  sed -E \
+    -e 's/(LARKSUITE_CLI_APP_SECRET=)[^[:space:]]+/\1[redacted]/g' \
+    -e 's/(FEISHU_APP_SECRET=)[^[:space:]]+/\1[redacted]/g' \
+    -e 's/(tenant_access_token["=: ]+)[^",[:space:]]+/\1[redacted]/g' \
+    -e 's/(Authorization: Bearer )[A-Za-z0-9._-]+/\1[redacted]/g'
+}
+
+recent_logs_text() {
+  if [[ ! -f "$TASK_LOG_FILE" ]]; then
+    printf '还没有任务日志。'
+    return
+  fi
+
+  tail -n 25 "$TASK_LOG_FILE" |
+    redact_log
+}
+
+compact_text() {
+  local max="${1:-240}"
+  TRUNCATE_MAX="$max" perl -CS -Mutf8 -0pe '
+    BEGIN { $max = $ENV{"TRUNCATE_MAX"} || 240 }
+    s/\s+/ /g;
+    s/^\s+|\s+$//g;
+    if (length($_) > $max) { $_ = substr($_, 0, $max) . "..." }
+  '
+}
+
+valid_session_ref() {
+  [[ "$1" =~ ^#?[A-Za-z0-9-]{1,80}$ ]]
+}
+
+session_db_row() {
+  local session_id="$1"
+
+  valid_session_ref "$session_id" || return 1
+  session_id="${session_id#\#}"
+
+  [[ -f "$CODEX_STATE_DB" ]] || return 1
+  sqlite3 -tabs -noheader "$CODEX_STATE_DB" "
+    select
+      id,
+      coalesce(datetime(updated_at_ms / 1000, 'unixepoch', 'localtime'), ''),
+      substr(replace(replace(coalesce(title, ''), char(10), ' '), char(13), ' '), 1, 72),
+      coalesce(cwd, ''),
+      coalesce(rollout_path, ''),
+      coalesce(archived, 0)
+    from threads
+    where id = '$session_id'
+    limit 1;
+  "
+}
+
+session_title() {
+  local row id updated title cwd rollout_path archived
+
+  row="$(session_db_row "$1" || true)"
+  if [[ -n "$row" ]]; then
+    IFS=$'\t' read -r id updated title cwd rollout_path archived <<<"$row"
+    printf '%s' "$title"
+    return
+  fi
+
+  printf '%s' "$1"
+}
+
+session_alias_number() {
+  local session_id="$1"
+
+  [[ -f "$SESSION_ALIAS_FILE" ]] || return 1
+  awk -F '\t' -v id="$session_id" '$2 == id { print $1; exit }' "$SESSION_ALIAS_FILE"
+}
+
+find_session_file() {
+  local session_id="$1"
+  local row id updated title cwd rollout_path archived
+
+  valid_session_ref "$session_id" || return 1
+  session_id="${session_id#\#}"
+
+  row="$(session_db_row "$session_id" || true)"
+  if [[ -n "$row" ]]; then
+    IFS=$'\t' read -r id updated title cwd rollout_path archived <<<"$row"
+    if [[ -n "${rollout_path:-}" && -f "$rollout_path" ]]; then
+      printf '%s' "$rollout_path"
+      return 0
+    fi
+  fi
+
+  find "$CODEX_SESSIONS_ROOT" -type f -name "*$session_id*.jsonl" 2>/dev/null |
+    tail -n 1
+}
+
+resolve_session_ref() {
+  local ref="$1"
+  local alias
+
+  valid_session_ref "$ref" || return 1
+  ref="${ref#\#}"
+
+  if [[ "$ref" =~ ^[0-9]+$ && -f "$SESSION_ALIAS_FILE" ]]; then
+    alias="$(awk -F '\t' -v n="$ref" '$1 == n { print $2; exit }' "$SESSION_ALIAS_FILE")"
+    if [[ -n "$alias" ]]; then
+      printf '%s' "$alias"
+      return 0
+    fi
+  fi
+
+  if [[ "$ref" =~ ^[A-Za-z0-9]+-[A-Za-z0-9-]+$ ]]; then
+    printf '%s' "$ref"
+    return 0
+  fi
+
+  return 1
+}
+
+session_recent_activity_text() {
+  local file="$1"
+
+  tail -n 700 "$file" |
+    jq -r '
+      def clean($n): tostring | gsub("[\\r\\n\\t ]+"; " ") | .[0:$n];
+      def when: (.timestamp // "") | sub("T"; " ") | sub("\\..*"; "Z");
+      if .type == "event_msg" and .payload.type == "user_message" then
+        "- " + when + " 用户: " + (.payload.message | clean(220))
+      elif .type == "event_msg" and .payload.type == "agent_message" then
+        "- " + when + " Codex: " + (.payload.message | clean(320))
+      elif .type == "event_msg" and .payload.type == "task_complete" then
+        "- " + when + " 完成: " + ((.payload.last_agent_message // "任务完成") | clean(260))
+      elif .type == "response_item" and .payload.type == "function_call" then
+        "- " + when + " 工具: " + ((.payload.name // "function_call") | clean(80))
+      else empty end
+    ' |
+    tail -n 10
+}
+
+session_stream_text() {
+  local session_id="$1"
+  local from_line="${2:-1}"
+  local limit="${3:-24}"
+  local file row id updated title cwd rollout_path archived number prefix body
+
+  session_id="$(resolve_session_ref "$session_id" || true)"
+  if [[ -z "$session_id" ]]; then
+    printf 'codex-tail: unknown session. 发送 目录 查看编号。'
+    return
+  fi
+
+  file="$(find_session_file "$session_id")"
+  if [[ -z "$file" || ! -f "$file" ]]; then
+    printf 'codex-tail: session file not found: %s' "$session_id"
+    return
+  fi
+
+  row="$(session_db_row "$session_id" || true)"
+  if [[ -n "$row" ]]; then
+    IFS=$'\t' read -r id updated title cwd rollout_path archived <<<"$row"
+  else
+    title="$session_id"
+    cwd=""
+  fi
+  number="$(session_alias_number "$session_id" || true)"
+  [[ -n "$number" ]] && prefix="#$number " || prefix=""
+
+  if ((from_line < 1)); then
+    from_line=1
+  fi
+
+  body="$(
+    tail -n +"$from_line" "$file" |
+      jq -r '
+        def clean($n): tostring | gsub("[\\r\\n\\t ]+"; " ") | .[0:$n];
+        def tm:
+          (.timestamp // "")
+          | sub("T"; " ")
+          | sub("\\..*"; "Z");
+        if .type == "event_msg" and .payload.type == "user_message" then
+          "[" + tm + "] user$ " + (.payload.message | clean(260))
+        elif .type == "event_msg" and .payload.type == "agent_message" then
+          "[" + tm + "] codex> " + (.payload.message | clean(420))
+        elif .type == "event_msg" and .payload.type == "task_started" then
+          "[" + tm + "] task> started"
+        elif .type == "event_msg" and .payload.type == "task_complete" then
+          "[" + tm + "] done> " + ((.payload.last_agent_message // "task complete") | clean(320))
+        elif .type == "event_msg" and .payload.type == "exec_command_end" then
+          "[" + tm + "] exec> " + ((.payload.cmd // .payload.command // "command finished") | clean(160))
+        elif .type == "response_item" and .payload.type == "function_call" then
+          "[" + tm + "] tool> " + ((.payload.name // "function_call") | clean(120))
+        else empty end
+      ' |
+      tail -n "$limit"
+  )"
+
+  printf '$ codex tail -f %s%s\n' "$prefix" "${title:-未命名}"
+  [[ -n "$cwd" ]] && printf 'cwd: %s\n' "$cwd"
+  printf 'session: %s\n' "$session_id"
+  printf -- '---\n'
+  if [[ -n "$body" ]]; then
+    printf '%s' "$body"
+  else
+    printf '[%s] wait> 暂无新事件' "$(timestamp)"
+  fi
+}
+
+session_summary_text() {
+  local session_id="$1"
+  local file row id updated title cwd rollout_path archived lines last_ts activity
+
+  session_id="$(resolve_session_ref "$session_id" || true)"
+  if [[ -z "$session_id" ]]; then
+    printf '没有找到这个会话编号。发送 目录 查看当前可用编号。'
+    return
+  fi
+
+  file="$(find_session_file "$session_id")"
+  if [[ -z "$file" || ! -f "$file" ]]; then
+    printf '找到了会话编号，但没有找到对应的会话文件：%s' "$session_id"
+    return
+  fi
+
+  row="$(session_db_row "$session_id" || true)"
+  if [[ -n "$row" ]]; then
+    IFS=$'\t' read -r id updated title cwd rollout_path archived <<<"$row"
+  else
+    title="$session_id"
+    updated=""
+    cwd=""
+    archived="0"
+  fi
+
+  lines="$(wc -l <"$file" | tr -d ' ')"
+  last_ts="$(tail -n 1 "$file" | jq -r '.timestamp // empty' 2>/dev/null || true)"
+  activity="$(session_recent_activity_text "$file" || true)"
+  [[ -n "$activity" ]] || activity='- 暂无可读进展。'
+
+  printf '会话进度\n'
+  printf '编号/ID: %s\n' "$session_id"
+  printf '标题: %s\n' "${title:-未命名}"
+  [[ -n "${updated:-}" ]] && printf '索引更新时间: %s\n' "$updated"
+  [[ -n "${last_ts:-}" ]] && printf '最后事件: %s\n' "$last_ts"
+  [[ -n "${cwd:-}" ]] && printf '工作区: %s\n' "$cwd"
+  printf '记录行数: %s\n\n' "$lines"
+  printf '最近进展:\n%s' "$activity"
+}
+
+set_active_session() {
+  local session_id="$1"
+  local seconds="$2"
+  local title expires_at
+
+  title="$(session_title "$session_id")"
+  expires_at=$(($(date '+%s') + seconds))
+  jq -n \
+    --arg session_id "$session_id" \
+    --arg title "$title" \
+    --arg started_at "$(timestamp)" \
+    --argjson expires_at "$expires_at" \
+    '{session_id:$session_id,title:$title,started_at:$started_at,expires_at:$expires_at}' \
+    >"$ACTIVE_SESSION_FILE"
+}
+
+active_session_id() {
+  local now expires_at session_id
+
+  [[ -f "$ACTIVE_SESSION_FILE" ]] || return 1
+  now="$(date '+%s')"
+  expires_at="$(jq -r '.expires_at // 0' "$ACTIVE_SESSION_FILE" 2>/dev/null || printf '0')"
+  session_id="$(jq -r '.session_id // empty' "$ACTIVE_SESSION_FILE" 2>/dev/null || true)"
+  if [[ -n "$session_id" && "$expires_at" =~ ^[0-9]+$ && "$now" -lt "$expires_at" ]]; then
+    printf '%s' "$session_id"
+    return 0
+  fi
+
+  rm -f "$ACTIVE_SESSION_FILE"
+  return 1
+}
+
+active_session_remaining_seconds() {
+  local now expires_at remaining
+
+  [[ -f "$ACTIVE_SESSION_FILE" ]] || return 1
+  now="$(date '+%s')"
+  expires_at="$(jq -r '.expires_at // 0' "$ACTIVE_SESSION_FILE" 2>/dev/null || printf '0')"
+  [[ "$expires_at" =~ ^[0-9]+$ ]] || return 1
+  remaining=$((expires_at - now))
+  ((remaining > 0)) || return 1
+  printf '%s' "$remaining"
+}
+
+sync_remaining_seconds() {
+  local now expires_at remaining
+
+  [[ -f "$SYNC_FILE" ]] || return 1
+  now="$(date '+%s')"
+  expires_at="$(jq -r '.expires_at // 0' "$SYNC_FILE" 2>/dev/null || printf '0')"
+  [[ "$expires_at" =~ ^[0-9]+$ ]] || return 1
+  remaining=$((expires_at - now))
+  ((remaining > 0)) || return 1
+  printf '%s' "$remaining"
+}
+
+update_sync_session() {
+  local session_id="$1"
+  local seconds="$2"
+  local expires_at tmp
+
+  [[ -f "$SYNC_FILE" ]] || return 1
+  expires_at=$(($(date '+%s') + seconds))
+  tmp="$SYNC_FILE.$$"
+  jq \
+    --arg session_id "$session_id" \
+    --argjson expires_at "$expires_at" \
+    '.session_id = $session_id | .expires_at = $expires_at' \
+    "$SYNC_FILE" >"$tmp"
+  mv "$tmp" "$SYNC_FILE"
+}
+
+switch_session_ref() {
+  local message_id="$1"
+  local ref="$2"
+  local requested_seconds="${3:-}"
+  local session_id title seconds
+
+  session_id="$(resolve_session_ref "$ref" || true)"
+  if [[ -z "$session_id" ]]; then
+    reply "$message_id" "没有找到这个会话编号。发送 目录 查看当前可用编号。"
+    return
+  fi
+
+  title="$(session_title "$session_id")"
+  if [[ -n "$requested_seconds" ]]; then
+    seconds="$requested_seconds"
+  else
+    seconds="$(sync_remaining_seconds || active_session_remaining_seconds || true)"
+    [[ -n "$seconds" ]] || seconds=600
+  fi
+
+  if [[ -d "$SYNC_LOCK_DIR" ]]; then
+    set_active_session "$session_id" "$seconds"
+    update_sync_session "$session_id" "$seconds" || true
+    reply "$message_id" '$ codex switch '"$session_id"$'\n'"已切换到: $title"$'\n'"后续普通消息会发送到这个会话。"
+  else
+    start_sync "$message_id" "$seconds" "$session_id"
+  fi
+}
+
+build_session_directory_text() {
+  local tmp number seen out id row updated title cwd rollout_path archived tag
+
+  tmp="$SESSION_ALIAS_FILE.$$"
+  : >"$tmp"
+  number=1
+  seen=" "
+  out="会话目录"$'\n'"用法: 会话 1 / 同步会话 1 10分钟 / 置顶 1"$'\n'
+
+  if [[ -s "$PINNED_SESSIONS_FILE" ]]; then
+    out+=$'\n'"置顶:"$'\n'
+    while IFS= read -r id; do
+      valid_session_ref "$id" || continue
+      id="${id#\#}"
+      [[ "$seen" == *" $id "* ]] && continue
+      row="$(session_db_row "$id" || true)"
+      [[ -n "$row" ]] || continue
+      IFS=$'\t' read -r id updated title cwd rollout_path archived <<<"$row"
+      printf '%s\t%s\t%s\t%s\n' "$number" "$id" "$title" "$updated" >>"$tmp"
+      out+="[$number] $title"$'\n'"    $updated  $id"$'\n'
+      seen+=" $id "
+      number=$((number + 1))
+    done <"$PINNED_SESSIONS_FILE"
+  fi
+
+  out+=$'\n'"当前活跃:"$'\n'
+  if [[ -f "$CODEX_STATE_DB" ]]; then
+    while IFS=$'\t' read -r id updated title cwd rollout_path archived; do
+      [[ -n "$id" ]] || continue
+      [[ "$seen" == *" $id "* ]] && continue
+      printf '%s\t%s\t%s\t%s\n' "$number" "$id" "$title" "$updated" >>"$tmp"
+      out+="[$number] $title"$'\n'"    $updated  $id"$'\n'
+      seen+=" $id "
+      number=$((number + 1))
+    done < <(
+      sqlite3 -tabs -noheader "$CODEX_STATE_DB" "
+        select
+          id,
+          coalesce(datetime(updated_at_ms / 1000, 'unixepoch', 'localtime'), ''),
+          substr(replace(replace(coalesce(title, ''), char(10), ' '), char(13), ' '), 1, 72),
+          coalesce(cwd, ''),
+          coalesce(rollout_path, ''),
+          coalesce(archived, 0)
+        from threads
+        where archived = 0
+        order by updated_at_ms desc
+        limit 16;
+      "
+    )
+  fi
+
+  if ((number == 1)); then
+    rm -f "$tmp"
+    printf '还没有找到可编号的 Codex 会话。'
+    return
+  fi
+
+  mv "$tmp" "$SESSION_ALIAS_FILE"
+  printf '%s' "$out"
+}
+
+pin_session_ref() {
+  local message_id="$1"
+  local ref="$2"
+  local session_id title tmp
+
+  session_id="$(resolve_session_ref "$ref" || true)"
+  if [[ -z "$session_id" ]]; then
+    reply "$message_id" "没有找到这个会话编号。先发送 目录 获取编号。"
+    return
+  fi
+
+  title="$(session_title "$session_id")"
+  tmp="$PINNED_SESSIONS_FILE.$$"
+  { [[ -f "$PINNED_SESSIONS_FILE" ]] && grep -v -F -x "$session_id" "$PINNED_SESSIONS_FILE" || true; printf '%s\n' "$session_id"; } >"$tmp"
+  mv "$tmp" "$PINNED_SESSIONS_FILE"
+  reply "$message_id" "已置顶: $title"$'\n'"$session_id"
+}
+
+unpin_session_ref() {
+  local message_id="$1"
+  local ref="$2"
+  local session_id title tmp
+
+  session_id="$(resolve_session_ref "$ref" || true)"
+  if [[ -z "$session_id" ]]; then
+    reply "$message_id" "没有找到这个会话编号。先发送 目录 获取编号。"
+    return
+  fi
+
+  title="$(session_title "$session_id")"
+  tmp="$PINNED_SESSIONS_FILE.$$"
+  [[ -f "$PINNED_SESSIONS_FILE" ]] && grep -v -F -x "$session_id" "$PINNED_SESSIONS_FILE" >"$tmp" || : >"$tmp"
+  mv "$tmp" "$PINNED_SESSIONS_FILE"
+  reply "$message_id" "已取消置顶: $title"
+}
+
+parse_sync_seconds() {
+  local text="$1"
+  local amount unit seconds
+
+  if [[ "$text" =~ ^(同步|sync)$ ]]; then
+    printf '600'
+    return 0
+  fi
+
+  if [[ "$text" =~ ^(同步|sync)[[:space:]]*([0-9]+)[[:space:]]*(秒|s|sec|second|seconds)$ ]]; then
+    amount="${BASH_REMATCH[2]}"
+    seconds="$amount"
+  elif [[ "$text" =~ ^(同步|sync)[[:space:]]*([0-9]+)[[:space:]]*(分钟|分|m|min|minute|minutes)?$ ]]; then
+    amount="${BASH_REMATCH[2]}"
+    unit="${BASH_REMATCH[3]:-分钟}"
+    case "$unit" in
+      秒|s|sec|second|seconds) seconds="$amount" ;;
+      *) seconds=$((amount * 60)) ;;
+    esac
+  else
+    return 1
+  fi
+
+  if ((seconds < 15)); then
+    seconds=15
+  fi
+  if ((seconds > SYNC_MAX_SECONDS)); then
+    seconds="$SYNC_MAX_SECONDS"
+  fi
+
+  printf '%s' "$seconds"
+}
+
+parse_duration_seconds() {
+  local text="${1:-}"
+
+  if [[ -z "$text" ]]; then
+    printf '600'
+    return 0
+  fi
+
+  parse_sync_seconds "同步 $text"
+}
+
+sync_snapshot_text() {
+  local session_id="${1:-}"
+
+  if [[ -n "$session_id" ]]; then
+    printf '会话同步 %s\n\n%s' \
+      "$(timestamp)" \
+      "$(session_summary_text "$session_id")"
+    return
+  fi
+
+  printf '进度同步 %s\n\n%s\n\n最近日志:\n%s' \
+    "$(timestamp)" \
+    "$(status_text)" \
+    "$(recent_logs_text)"
+}
+
+sync_loop() {
+  local message_id="$1"
+  local seconds="$2"
+  local session_id="${3:-}"
+  local started_at end_at state sleep_for last_lines current_lines session_file idle_ticks first_line current_active sync_expires
+
+  started_at="$(date '+%s')"
+  end_at=$((started_at + seconds))
+
+  jq -n \
+    --arg message_id "$message_id" \
+    --arg started_at "$(timestamp)" \
+    --arg session_id "$session_id" \
+    --argjson seconds "$seconds" \
+    --argjson expires_at "$end_at" \
+    --argjson interval "$SYNC_INTERVAL_SECONDS" \
+    '{message_id:$message_id,started_at:$started_at,session_id:$session_id,duration_seconds:$seconds,expires_at:$expires_at,interval_seconds:$interval}' \
+    >"$SYNC_FILE"
+
+  last_lines=0
+  idle_ticks=0
+
+  if [[ -n "$session_id" ]]; then
+    set_active_session "$session_id" "$seconds"
+    session_file="$(find_session_file "$session_id")"
+    if [[ -n "$session_file" && -f "$session_file" ]]; then
+      current_lines="$(wc -l <"$session_file" | tr -d ' ')"
+      first_line=$((current_lines - 500))
+      if ((first_line < 1)); then
+        first_line=1
+      fi
+      reply "$message_id" "$(session_stream_text "$session_id" "$first_line" 24)" || true
+      last_lines="$current_lines"
+    else
+      reply "$message_id" "$(session_stream_text "$session_id" 1 24)" || true
+    fi
+  fi
+
+  while :; do
+    if [[ -f "$SYNC_FILE" ]]; then
+      sync_expires="$(jq -r '.expires_at // empty' "$SYNC_FILE" 2>/dev/null || true)"
+      [[ "$sync_expires" =~ ^[0-9]+$ ]] && end_at="$sync_expires"
+    fi
+    (( $(date '+%s') < end_at )) || break
+
+    if [[ -f "$SYNC_STOP_FILE" ]]; then
+      reply "$message_id" "已停止进度同步。"
+      break
+    fi
+
+    if [[ -n "$session_id" ]]; then
+      current_active="$(active_session_id || true)"
+      if [[ -n "$current_active" && "$current_active" != "$session_id" ]]; then
+        session_id="$current_active"
+        session_file="$(find_session_file "$session_id")"
+        current_lines=0
+        if [[ -n "$session_file" && -f "$session_file" ]]; then
+          current_lines="$(wc -l <"$session_file" | tr -d ' ')"
+          first_line=$((current_lines - 500))
+          if ((first_line < 1)); then
+            first_line=1
+          fi
+        else
+          first_line=1
+        fi
+        last_lines="$current_lines"
+        idle_ticks=0
+        reply "$message_id" '$ codex switch '"$session_id"$'\n'"$(session_stream_text "$session_id" "$first_line" 18)" || true
+      fi
+
+      session_file="$(find_session_file "$session_id")"
+      current_lines=0
+      [[ -n "$session_file" && -f "$session_file" ]] && current_lines="$(wc -l <"$session_file" | tr -d ' ')"
+      if ((last_lines > 0 && current_lines == last_lines)); then
+        idle_ticks=$((idle_ticks + 1))
+        if ((idle_ticks % 15 == 0)); then
+          reply "$message_id" '$ codex tail -f'" $session_id"$'\n'"[$(timestamp)] wait> 仍在监听；直接发消息会发送到这个会话。" || true
+        fi
+      else
+        if ((last_lines > 0)); then
+          reply "$message_id" "$(session_stream_text "$session_id" $((last_lines + 1)) 30)" || true
+        else
+          reply "$message_id" "$(session_stream_text "$session_id" 1 30)" || true
+        fi
+        idle_ticks=0
+      fi
+      last_lines="$current_lines"
+    else
+      reply "$message_id" "$(sync_snapshot_text)" || true
+    fi
+
+    state=""
+    if [[ -z "$session_id" && -f "$STATUS_FILE" ]]; then
+      state="$(jq -r '.state // empty' "$STATUS_FILE")"
+    fi
+    if [[ "$state" == "completed" || "$state" == "failed" ]]; then
+      break
+    fi
+
+    if [[ -n "$session_id" ]]; then
+      sleep_for="$SESSION_STREAM_INTERVAL_SECONDS"
+    else
+      sleep_for="$SYNC_INTERVAL_SECONDS"
+    fi
+    if (( $(date '+%s') + sleep_for > end_at )); then
+      sleep_for=$((end_at - $(date '+%s')))
+    fi
+    if ((sleep_for <= 0)); then
+      break
+    fi
+    sleep "$sleep_for"
+  done
+
+  rm -f "$SYNC_FILE" "$SYNC_STOP_FILE"
+  if [[ -n "$session_id" ]]; then
+    current_active="$(active_session_id || true)"
+    [[ "$current_active" == "$session_id" ]] && rm -f "$ACTIVE_SESSION_FILE"
+  fi
+  rmdir "$SYNC_LOCK_DIR" 2>/dev/null || true
+}
+
+start_sync() {
+  local message_id="$1"
+  local seconds="$2"
+  local session_id="${3:-}"
+
+  if ! mkdir "$SYNC_LOCK_DIR" 2>/dev/null; then
+    if [[ -n "$session_id" ]]; then
+      switch_session_ref "$message_id" "$session_id" "$seconds"
+      return
+    fi
+    reply "$message_id" "已有进度同步正在运行。发送 停止同步 结束当前同步。"
+    return
+  fi
+
+  rm -f "$SYNC_STOP_FILE"
+  if [[ -n "$session_id" ]]; then
+    set_active_session "$session_id" "$seconds"
+    reply "$message_id" "已附着会话，持续 ${seconds} 秒。期间直接发消息会发送到这个会话；发送 停止同步 可提前结束。"
+  else
+    reply "$message_id" "已开启进度同步，持续 ${seconds} 秒。发送 停止同步 可提前结束。"
+  fi
+  sync_loop "$message_id" "$seconds" "$session_id" &
+}
+
+stop_sync() {
+  local message_id="$1"
+
+  if [[ ! -d "$SYNC_LOCK_DIR" ]]; then
+    reply "$message_id" "当前没有正在运行的进度同步。"
+    return
+  fi
+
+  : >"$SYNC_STOP_FILE"
+  rm -f "$ACTIVE_SESSION_FILE"
+  reply "$message_id" "收到，正在停止进度同步。"
+}
+
+run_codex_task() {
+  local task_id="$1"
+  local message_id="$2"
+  local prompt="$3"
+  local session_id="${4:-}"
+  local reply_mode="${5:-final}"
+  local output_file codex_exit codex_pid
+  local resume_args=()
+
+  output_file="$(mktemp -t lark-codex-output.XXXXXX)"
+  : >"$TASK_LOG_FILE"
+  if [[ -n "$session_id" ]]; then
+    set_status "running" "$task_id" "$message_id" "$prompt" "正在发送到会话 $session_id"
+  else
+    set_status "running" "$task_id" "$message_id" "$prompt" "Codex 正在执行"
+  fi
+
+  {
+    echo "$(timestamp) task_id=$task_id started"
+    echo "model=$CODEX_MODEL"
+    echo "workdir=$CODEX_WORKDIR"
+    [[ -n "$session_id" ]] && echo "resume_session=$session_id"
+    echo
+  } >>"$TASK_LOG_FILE"
+
+  if [[ -n "$session_id" ]]; then
+    if [[ "$LARK_CODEX_DANGEROUS_BYPASS" == "true" ]]; then
+      resume_args+=(--dangerously-bypass-approvals-and-sandbox)
+    fi
+    (
+      printf '%s' "$prompt" |
+        "$CODEX_BIN" exec resume \
+          -m "$CODEX_MODEL" \
+          --skip-git-repo-check \
+          "${resume_args[@]}" \
+          -o "$output_file" \
+          "$session_id" \
+          -
+    ) >>"$TASK_LOG_FILE" 2>&1 &
+    codex_pid=$!
+    if wait_with_timeout "$codex_pid"; then
+      codex_exit=0
+    else
+      codex_exit=$?
+    fi
+  else
+    (
+      printf '%s' "$prompt" |
+        "$CODEX_BIN" exec \
+          -C "$CODEX_WORKDIR" \
+          -m "$CODEX_MODEL" \
+          --skip-git-repo-check \
+          --full-auto \
+          -o "$output_file" \
+          -
+    ) >>"$TASK_LOG_FILE" 2>&1 &
+    codex_pid=$!
+    if wait_with_timeout "$codex_pid"; then
+      codex_exit=0
+    else
+      codex_exit=$?
+    fi
+  fi
+
+  if ((codex_exit == 0)); then
+    local answer
+    answer="$(cat "$output_file")"
+    [[ -n "$answer" ]] || answer="Codex finished, but did not return a final message."
+    echo "$(timestamp) task_id=$task_id completed" >>"$TASK_LOG_FILE"
+    set_status "completed" "$task_id" "$message_id" "$prompt" "已回复结果"
+    reply "$message_id" "$(final_reply_text "$answer")" || echo "Failed to reply to $message_id" >&2
+  else
+    echo "$(timestamp) task_id=$task_id failed" >>"$TASK_LOG_FILE"
+    set_status "failed" "$task_id" "$message_id" "$prompt" "发送 logs 查看最近日志"
+    reply "$message_id" "$(failed_reply_text "Codex failed while handling this request.")" || true
+  fi
+
+  rm -f "$output_file"
+  pop_queue_task || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+echo "$(timestamp) Listening for Feishu messages from the allowed sender" >&2
+refresh_tenant_token
+queue_watch_loop &
+
+lark-cli event +subscribe \
+  --event-types im.message.receive_v1 \
+  --compact \
+  --quiet |
+while IFS= read -r line; do
+  content="$(jq -r '.content // empty' <<<"$line")"
+  message_id="$(jq -r '.message_id // empty' <<<"$line")"
+  sender_id="$(jq -r '.sender_id // empty' <<<"$line")"
+
+  [[ -n "$content" && -n "$message_id" ]] || continue
+
+  prompt="$content"
+  if [[ "$prompt" == "$COMMAND_PREFIX" ]]; then
+    prompt=""
+  elif [[ "$prompt" == "$COMMAND_PREFIX "* ]]; then
+    prompt="${prompt#"$COMMAND_PREFIX "}"
+  elif [[ "$prompt" == "$COMMAND_PREFIX"$'\u3000'* ]]; then
+    prompt="${prompt#"$COMMAND_PREFIX"$'\u3000'}"
+  fi
+
+  echo "$(timestamp) command message_id=$message_id sender_id=$sender_id content_length=${#content}" >&2
+
+  if [[ -n "$ALLOWED_SENDER" && "$sender_id" != "$ALLOWED_SENDER" ]]; then
+    echo "$(timestamp) ignored sender_id=$sender_id; allowed_sender=$ALLOWED_SENDER" >&2
+    continue
+  fi
+
+  if [[ -z "$prompt" ]]; then
+    reply "$message_id" "收到。直接发送要我处理的内容即可。发送 目录 查看会话编号，help 查看命令。"
+    continue
+  fi
+
+  case "$prompt" in
+    status|状态)
+      reply "$message_id" "$(status_text)"
+      continue
+      ;;
+    logs|日志)
+      reply "$message_id" "$(logs_text)"
+      continue
+      ;;
+    queue|队列)
+      reply "$message_id" "$(queue_text)"
+      continue
+      ;;
+    help|帮助)
+      reply "$message_id" "直接发送内容 = 让 Codex 执行任务；忙时自动排队"$'\n'"目录 = 查看会话编号"$'\n'"会话 1 = 查看会话进度"$'\n'"同步会话 1 10分钟 = 像终端 tail 一样同步，并附着这个会话"$'\n'"切换 2 = 在同步流里切到另一个会话"$'\n'"队列 = 查看等待执行的消息"$'\n'"置顶 1 / 取消置顶 1 = 管理目录置顶"$'\n'"停止同步 = 结束同步并脱离会话"$'\n'"status / logs = 查看桥接任务"
+      continue
+      ;;
+    目录|会话目录|sessions|"session list")
+      reply "$message_id" "$(build_session_directory_text)"
+      continue
+      ;;
+  esac
+
+  if [[ "$prompt" =~ ^(会话|session)[[:space:]]+([^[:space:]]+)$ ]]; then
+    reply "$message_id" "$(session_summary_text "${BASH_REMATCH[2]}")"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(置顶|pin)[[:space:]]+([^[:space:]]+)$ ]]; then
+    pin_session_ref "$message_id" "${BASH_REMATCH[2]}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(取消置顶|unpin)[[:space:]]+([^[:space:]]+)$ ]]; then
+    unpin_session_ref "$message_id" "${BASH_REMATCH[2]}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(停止同步|stop[[:space:]]+sync|sync[[:space:]]+stop)$ ]]; then
+    stop_sync "$message_id"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(切换会话|切换到|切换|switch|attach)[[:space:]]*([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
+    session_ref="${BASH_REMATCH[2]}"
+    duration_text="${BASH_REMATCH[4]:-}"
+    if [[ -n "$duration_text" ]]; then
+      sync_seconds="$(parse_duration_seconds "$duration_text" || true)"
+      if [[ -z "$sync_seconds" ]]; then
+        reply "$message_id" "切换时长没看懂。可以发：切换 2 10分钟"
+        continue
+      fi
+      switch_session_ref "$message_id" "$session_ref" "$sync_seconds"
+    else
+      switch_session_ref "$message_id" "$session_ref"
+    fi
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(同步会话|sync[[:space:]]+session)[[:space:]]+([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
+    session_ref="${BASH_REMATCH[2]}"
+    duration_text="${BASH_REMATCH[4]:-}"
+    session_id="$(resolve_session_ref "$session_ref" || true)"
+    if [[ -z "$session_id" ]]; then
+      reply "$message_id" "没有找到这个会话编号。发送 目录 查看当前可用编号。"
+      continue
+    fi
+    sync_seconds="$(parse_duration_seconds "$duration_text" || true)"
+    if [[ -z "$sync_seconds" ]]; then
+      reply "$message_id" "同步时长没看懂。可以发：同步会话 1 10分钟"
+      continue
+    fi
+    start_sync "$message_id" "$sync_seconds" "$session_id"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^同步[[:space:]]+([^[:space:]]+)[[:space:]]+(.+)$ ]]; then
+    session_ref="${BASH_REMATCH[1]}"
+    duration_text="${BASH_REMATCH[2]}"
+    session_id="$(resolve_session_ref "$session_ref" || true)"
+    if [[ -n "$session_id" ]]; then
+      sync_seconds="$(parse_duration_seconds "$duration_text" || true)"
+      if [[ -z "$sync_seconds" ]]; then
+        reply "$message_id" "同步时长没看懂。可以发：同步 1 10分钟"
+        continue
+      fi
+      start_sync "$message_id" "$sync_seconds" "$session_id"
+      continue
+    fi
+  fi
+
+  if sync_seconds="$(parse_sync_seconds "$prompt")"; then
+    start_sync "$message_id" "$sync_seconds"
+    continue
+  fi
+
+  attached_session_id="$(active_session_id || true)"
+  if [[ -n "$attached_session_id" ]]; then
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      enqueue_task "$message_id" "$prompt" "$attached_session_id" "stream"
+      continue
+    fi
+
+    task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
+    set_status "queued" "$task_id" "$message_id" "$prompt" "已发送到会话 $attached_session_id"
+    reply "$message_id" "$ACK_EMOJI"
+    run_codex_task "$task_id" "$message_id" "$prompt" "$attached_session_id" "stream" &
+    continue
+  fi
+
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    enqueue_task "$message_id" "$prompt" "" "final"
+    continue
+  fi
+
+  task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
+  set_status "queued" "$task_id" "$message_id" "$prompt" "已进入后台执行"
+  reply "$message_id" "$ACK_EMOJI"
+  run_codex_task "$task_id" "$message_id" "$prompt" &
+done

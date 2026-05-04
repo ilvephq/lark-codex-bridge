@@ -1,0 +1,283 @@
+# lark-codex-bridge
+
+用飞书/Lark 机器人在手机上远程控制本机 Codex CLI。普通消息会触发 Codex，机器人先回复 `👀` 表示收到，任务完成后回复 `✅ 完成` 和最终结果。
+
+> 安全提醒：这个桥接会让指定飞书/Lark 用户远程触发你电脑上的 Codex。公开版默认不开启高权限 bypass。只有你显式设置 `LARK_CODEX_DANGEROUS_BYPASS=true` 时，续接会话才会使用 `--dangerously-bypass-approvals-and-sandbox`。
+
+## 功能
+
+- 直接发消息给机器人，让 Codex 执行任务。
+- 忙时自动排队。
+- 查看 Codex 会话目录，并用编号选择会话。
+- 同步会话进度，像手机上的轻量终端流。
+- 在同步期间直接给当前会话继续发消息。
+- 支持 `screen` 后台运行。
+
+## 依赖
+
+macOS 上需要这些命令：
+
+- `bash`
+- `jq`
+- `curl`
+- `sqlite3`
+- `lark-cli`
+- `codex`
+- `screen`
+
+Codex CLI 和 lark-cli 需要先能在终端里正常运行。
+
+## 安装
+
+```bash
+git clone https://github.com/YOUR_NAME/lark-codex-bridge.git
+cd lark-codex-bridge
+./scripts/install.sh
+```
+
+安装脚本会创建：
+
+```text
+~/.lark-codex/.env
+```
+
+然后编辑这个文件，填入你的飞书/Lark App 信息和允许控制 Codex 的用户 open_id：
+
+```bash
+LARKSUITE_CLI_APP_ID=cli_xxxxxxxxxxxxxxxxx
+LARKSUITE_CLI_APP_SECRET=replace_me
+LARK_CODEX_ALLOWED_SENDER=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+## 飞书/Lark App 配置
+
+1. 在飞书/Lark 开放平台创建自建应用。
+2. 开启机器人能力。
+3. 给应用添加收发消息所需权限。
+4. 配置事件订阅，让应用能接收 `im.message.receive_v1`。
+5. 发布/启用应用，并把机器人添加到你要使用的会话里。
+6. 获取你的用户 `open_id`，填入 `LARK_CODEX_ALLOWED_SENDER`。
+
+## 启动和停止
+
+```bash
+./scripts/start-screen.sh
+```
+
+查看日志：
+
+```bash
+tail -f ~/.lark-codex/bridge.log
+```
+
+停止：
+
+```bash
+./scripts/stop-screen.sh
+```
+
+## 常用命令
+
+在飞书/Lark 机器人里发送：
+
+```text
+status
+```
+
+查看桥接状态。
+
+```text
+目录
+```
+
+列出当前可用 Codex 会话编号。
+
+```text
+会话 1
+```
+
+查看编号 `1` 的最近进度。
+
+```text
+同步会话 1 10分钟
+```
+
+附着到编号 `1` 的会话并同步 10 分钟。同步期间，直接发送普通消息会进入这个会话。
+
+```text
+切换 2
+```
+
+同步期间切换到编号 `2` 的会话。
+
+```text
+停止同步
+```
+
+结束当前同步。
+
+```text
+队列
+```
+
+查看等待执行的消息。
+
+```text
+logs
+```
+
+查看最近任务日志。
+
+## 配置项
+
+常用配置写在 `~/.lark-codex/.env`：
+
+```bash
+LARK_CODEX_BASE_DIR=$HOME/.lark-codex
+LARK_CODEX_WORKDIR=$HOME
+LARK_CODEX_MODEL=gpt-5.2
+LARK_CODEX_ACK_EMOJI=👀
+LARK_CODEX_TASK_TIMEOUT_SECONDS=900
+LARK_CODEX_DANGEROUS_BYPASS=false
+```
+
+`LARK_CODEX_WORKDIR` 是新建 Codex 任务时使用的默认工作目录。续接已有会话时，Codex 会使用会话自己的上下文。
+
+## 高权限模式
+
+默认：
+
+```bash
+LARK_CODEX_DANGEROUS_BYPASS=false
+```
+
+这表示公开版不会默认给远程消息开启 Codex 的危险 bypass 参数。
+
+如果你确认只允许可信账号使用，并接受远程触发本机文件修改的风险，可以显式开启：
+
+```bash
+LARK_CODEX_DANGEROUS_BYPASS=true
+```
+
+开启后，续接会话会使用：
+
+```text
+--dangerously-bypass-approvals-and-sandbox
+```
+
+请只在个人机器和可信飞书/Lark 账号下使用。
+
+---
+
+# English
+
+Control your local Codex CLI from a Feishu/Lark bot on your phone. A normal message triggers Codex, the bot replies `👀` as an acknowledgement, then sends `✅ Done` with the final result when the task completes.
+
+> Security note: this bridge lets one configured Feishu/Lark user remotely trigger Codex on your computer. Dangerous bypass mode is off by default. It is only enabled when you explicitly set `LARK_CODEX_DANGEROUS_BYPASS=true`.
+
+## Features
+
+- Send normal bot messages to run Codex tasks.
+- Automatic queueing while Codex is busy.
+- List Codex sessions and refer to them by number.
+- Follow a session like a lightweight terminal stream.
+- Send follow-up messages into the attached session.
+- Run in the background with `screen`.
+
+## Requirements
+
+On macOS, the following commands must be available:
+
+- `bash`
+- `jq`
+- `curl`
+- `sqlite3`
+- `lark-cli`
+- `codex`
+- `screen`
+
+Make sure both Codex CLI and lark-cli work in your terminal first.
+
+## Install
+
+```bash
+git clone https://github.com/YOUR_NAME/lark-codex-bridge.git
+cd lark-codex-bridge
+./scripts/install.sh
+```
+
+The installer creates:
+
+```text
+~/.lark-codex/.env
+```
+
+Edit it and fill in your own Feishu/Lark app credentials and allowed sender open_id:
+
+```bash
+LARKSUITE_CLI_APP_ID=cli_xxxxxxxxxxxxxxxxx
+LARKSUITE_CLI_APP_SECRET=replace_me
+LARK_CODEX_ALLOWED_SENDER=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+## Feishu/Lark App Setup
+
+1. Create a custom app in the Feishu/Lark developer console.
+2. Enable bot capability.
+3. Grant the app message permissions.
+4. Enable event subscription for `im.message.receive_v1`.
+5. Publish/enable the app and add the bot to your chat.
+6. Put your user `open_id` into `LARK_CODEX_ALLOWED_SENDER`.
+
+## Start and Stop
+
+```bash
+./scripts/start-screen.sh
+```
+
+View logs:
+
+```bash
+tail -f ~/.lark-codex/bridge.log
+```
+
+Stop:
+
+```bash
+./scripts/stop-screen.sh
+```
+
+## Bot Commands
+
+Send these to your Feishu/Lark bot:
+
+- `status`: show bridge status.
+- `目录` or `sessions`: list Codex sessions.
+- `会话 1`: show recent progress for session `1`.
+- `同步会话 1 10分钟`: attach and stream session `1` for 10 minutes.
+- `切换 2`: switch the attached stream to session `2`.
+- `停止同步`: stop streaming.
+- `队列`: show queued messages.
+- `logs`: show recent task logs.
+
+## Dangerous Mode
+
+Default:
+
+```bash
+LARK_CODEX_DANGEROUS_BYPASS=false
+```
+
+To allow resumed sessions to run with Codex's dangerous bypass flag:
+
+```bash
+LARK_CODEX_DANGEROUS_BYPASS=true
+```
+
+This enables:
+
+```text
+--dangerously-bypass-approvals-and-sandbox
+```
+
+Only enable this on a personal machine with a trusted Feishu/Lark account.

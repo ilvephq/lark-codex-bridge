@@ -14,6 +14,7 @@
 - 同步会话进度，像手机上的轻量终端流（默认只在有新事件时推送，完全静默等待）。
 - 在同步期间直接给当前会话继续发消息。
 - 输出默认使用 Card JSON 2.0：主内容清爽可读，元信息放在折叠区（默认收起）。
+- 支持长任务：更长超时、任务记录、部分产物追踪，以及失败后 `继续任务`。
 - 支持 `screen` 后台运行。
 
 ## 依赖
@@ -145,6 +146,24 @@ status
 进入新会话待命状态。下一条普通消息会创建新的 Codex 会话，并自动常驻到这个新会话。
 
 ```text
+长任务 生成并写回这张表的前 3 行设计图
+```
+
+以长任务模式执行，默认超时 `LARK_CODEX_LONG_TASK_TIMEOUT_SECONDS=3600`。适合图片生成、批量写表、长时间代码迁移等任务。
+
+```text
+任务
+```
+
+查看最近长任务状态、原始需求、尝试次数、已记录产物和下一步命令。
+
+```text
+继续任务
+```
+
+从最近失败或暂停的长任务继续。桥接会把原始需求、已记录产物和最近日志摘要一起发给 Codex，避免从头重做。若旧版本没有长任务记录，但当前窗口已有常驻会话，也会自动升级为长任务继续。
+
+```text
 会话 1
 ```
 
@@ -222,6 +241,7 @@ LARK_CODEX_CARD_SCHEMA=2
 LARK_CODEX_SYNC_RENDER=stream
 LARK_CODEX_ENABLE_MESSAGE_UPDATE=false
 LARK_CODEX_TASK_TIMEOUT_SECONDS=900
+LARK_CODEX_LONG_TASK_TIMEOUT_SECONDS=3600
 LARK_CODEX_DANGEROUS_BYPASS=false
 ```
 
@@ -268,6 +288,7 @@ Control your local Codex CLI from a Feishu/Lark bot on your phone. A normal mess
 - Keep one local Codex session attached with `切换 1`, so normal messages flow into that session.
 - Follow a session like a lightweight terminal stream (silent when nothing changes).
 - Send follow-up messages into the attached session.
+- Run long tasks with extended timeout, job records, artifact tracking, and `继续任务` resume.
 - Default output uses Card JSON 2.0 (clean main content; extra metadata folded in a collapsed panel).
 - Run in the background with `screen`.
 
@@ -353,6 +374,9 @@ Send these to your Feishu/Lark bot:
 - `新任务 <content>` or `new <content>`: force a new Codex task instead of using the current session.
 - `新会话 <content>` / `new session <content>`: create a new Codex session and make it the persistent current session.
 - `新会话` / `new session`: make the next normal message create and attach a new session.
+- `长任务 <content>` / `long <content>`: run an extended-timeout job.
+- `任务` / `task`: show the latest long job.
+- `继续任务` / `continue task`: resume the latest failed or paused long job. If no long-job record exists but a session is attached, it upgrades the continuation into a long job.
 - `会话 1`: show recent progress for session `1`.
 - `同步会话 1 10分钟`: stream session `1` for 10 minutes (only pushes when new events; no periodic keepalive).
 - `切换 2`: switch the attached stream to session `2`.

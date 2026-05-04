@@ -8,6 +8,8 @@ state/
 queue/
 *.log
 *.tmp
+output/
+tmp/
 
 # Node/npm caches if users experiment locally
 node_modules/

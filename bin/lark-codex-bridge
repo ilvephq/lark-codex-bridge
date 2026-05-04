@@ -12,6 +12,7 @@ LOG_FILE="${LARK_CODEX_LOG_FILE:-$BASE_DIR/bridge.log}"
 CODEX_MODEL="${LARK_CODEX_MODEL:-gpt-5.2}"
 CODEX_BIN="${LARK_CODEX_BIN:-codex}"
 CODEX_TASK_TIMEOUT_SECONDS="${LARK_CODEX_TASK_TIMEOUT_SECONDS:-900}"
+CODEX_LONG_TASK_TIMEOUT_SECONDS="${LARK_CODEX_LONG_TASK_TIMEOUT_SECONDS:-3600}"
 ACK_EMOJI="${LARK_CODEX_ACK_EMOJI:-👀}"
 ACK_MODE="${LARK_CODEX_ACK_MODE:-reaction}"
 ACK_REACTION_EMOJI="${LARK_CODEX_ACK_REACTION_EMOJI:-OK}"
@@ -43,6 +44,8 @@ SESSION_ALIAS_FILE=""
 PINNED_SESSIONS_FILE=""
 ACTIVE_SESSION_FILE=""
 NEW_SESSION_FILE=""
+JOBS_DIR=""
+LATEST_JOB_FILE=""
 SYNC_FILE=""
 SYNC_STOP_FILE=""
 SYNC_LOCK_DIR=""
@@ -61,6 +64,15 @@ if [[ "$OUTPUT_STYLE" != "compact" && "$OUTPUT_STYLE" != "verbose" ]]; then
 fi
 if [[ ! "$DIRECTORY_LIMIT" =~ ^[0-9]+$ ]]; then
   DIRECTORY_LIMIT=12
+fi
+if [[ ! "$CODEX_TASK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+  CODEX_TASK_TIMEOUT_SECONDS=900
+fi
+if [[ ! "$CODEX_LONG_TASK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+  CODEX_LONG_TASK_TIMEOUT_SECONDS=3600
+fi
+if ((CODEX_LONG_TASK_TIMEOUT_SECONDS < CODEX_TASK_TIMEOUT_SECONDS)); then
+  CODEX_LONG_TASK_TIMEOUT_SECONDS="$CODEX_TASK_TIMEOUT_SECONDS"
 fi
 
 timestamp() {
@@ -256,11 +268,13 @@ chat_context_load() {
   PINNED_SESSIONS_FILE="$CHAT_STATE_DIR/pinned_sessions.txt"
   ACTIVE_SESSION_FILE="$CHAT_STATE_DIR/active_session.json"
   NEW_SESSION_FILE="$CHAT_STATE_DIR/new_session_pending.json"
+  JOBS_DIR="$CHAT_STATE_DIR/jobs"
+  LATEST_JOB_FILE="$CHAT_STATE_DIR/latest_job.json"
   SYNC_FILE="$CHAT_STATE_DIR/sync.json"
   SYNC_STOP_FILE="$CHAT_STATE_DIR/sync.stop"
   SYNC_LOCK_DIR="$CHAT_STATE_DIR/sync.lock"
 
-  mkdir -p "$CHAT_STATE_DIR"
+  mkdir -p "$CHAT_STATE_DIR" "$JOBS_DIR"
   chat_settings_ensure
   chat_settings_load_into_vars
 }
@@ -619,6 +633,295 @@ set_status() {
     >"$STATUS_FILE"
 }
 
+job_file_path() {
+  local job_id="$1"
+  printf '%s/%s.json' "$JOBS_DIR" "$(safe_fs_id "$job_id")"
+}
+
+job_marker_path() {
+  local job_id="$1"
+  printf '%s/%s.marker' "$JOBS_DIR" "$(safe_fs_id "$job_id")"
+}
+
+latest_job_id() {
+  [[ -f "$LATEST_JOB_FILE" ]] || return 1
+  jq -r '.job_id // empty' "$LATEST_JOB_FILE" 2>/dev/null | head -n 1
+}
+
+resolve_job_ref() {
+  local ref="${1:-}"
+  local job_id
+
+  if [[ -z "$ref" || "$ref" == "latest" || "$ref" == "最近" ]]; then
+    job_id="$(latest_job_id || true)"
+  else
+    job_id="${ref#\#}"
+  fi
+
+  [[ -n "$job_id" && -f "$(job_file_path "$job_id")" ]] || return 1
+  printf '%s' "$job_id"
+}
+
+create_long_job() {
+  local message_id="$1"
+  local prompt="$2"
+  local session_id="${3:-}"
+  local timeout_seconds="${4:-$CODEX_LONG_TASK_TIMEOUT_SECONDS}"
+  local reply_mode="${5:-long}"
+  local job_id job_file marker
+
+  job_id="job-$(date '+%Y%m%d%H%M%S')-$message_id"
+  job_id="$(safe_fs_id "$job_id")"
+  job_file="$(job_file_path "$job_id")"
+  marker="$(job_marker_path "$job_id")"
+  : >"$marker"
+
+  jq -n \
+    --arg job_id "$job_id" \
+    --arg state "queued" \
+    --arg chat_id "${CHAT_ID:-unknown}" \
+    --arg message_id "$message_id" \
+    --arg original_prompt "$prompt" \
+    --arg prompt "$prompt" \
+    --arg session_id "$session_id" \
+    --arg reply_mode "$reply_mode" \
+    --arg workdir "${CHAT_WORKDIR:-$CODEX_WORKDIR}" \
+    --arg created_at "$(timestamp)" \
+    --arg updated_at "$(timestamp)" \
+    --argjson timeout_seconds "$timeout_seconds" \
+    '{
+      job_id:$job_id,
+      state:$state,
+      chat_id:$chat_id,
+      message_id:$message_id,
+      original_prompt:$original_prompt,
+      prompt:$prompt,
+      session_id:$session_id,
+      reply_mode:$reply_mode,
+      workdir:$workdir,
+      timeout_seconds:$timeout_seconds,
+      attempts:0,
+      artifacts:[],
+      created_at:$created_at,
+      updated_at:$updated_at
+    }' >"$job_file"
+
+  jq -n --arg job_id "$job_id" --arg updated_at "$(timestamp)" \
+    '{job_id:$job_id,updated_at:$updated_at}' >"$LATEST_JOB_FILE"
+  printf '%s' "$job_id"
+}
+
+job_update_state() {
+  local job_id="$1"
+  local state="$2"
+  local task_id="${3:-}"
+  local message_id="${4:-}"
+  local prompt="${5:-}"
+  local session_id="${6:-}"
+  local elapsed_seconds="${7:-}"
+  local last_error="${8:-}"
+  local job_file tmp
+
+  job_file="$(job_file_path "$job_id")"
+  [[ -f "$job_file" ]] || return 0
+  tmp="$job_file.$$"
+  jq \
+    --arg state "$state" \
+    --arg task_id "$task_id" \
+    --arg message_id "$message_id" \
+    --arg prompt "$prompt" \
+    --arg session_id "$session_id" \
+    --arg elapsed_seconds "$elapsed_seconds" \
+    --arg last_error "$last_error" \
+    --arg updated_at "$(timestamp)" \
+    '
+      (.state // "") as $old_state
+      |
+      .state = $state
+      | .updated_at = $updated_at
+      | if $task_id != "" then .task_id = $task_id else . end
+      | if $message_id != "" then .message_id = $message_id else . end
+      | if $prompt != "" then .prompt = $prompt else . end
+      | if $session_id != "" then .session_id = $session_id else . end
+      | if $elapsed_seconds != "" then .elapsed_seconds = ($elapsed_seconds|tonumber) else . end
+      | if $last_error != "" then .last_error = $last_error else . end
+      | if $state == "running" and $old_state != "running" then .attempts = ((.attempts // 0) + 1) else . end
+    ' "$job_file" >"$tmp"
+  mv "$tmp" "$job_file"
+  jq -n --arg job_id "$job_id" --arg updated_at "$(timestamp)" \
+    '{job_id:$job_id,updated_at:$updated_at}' >"$LATEST_JOB_FILE"
+}
+
+job_artifacts_json() {
+  local job_id="$1"
+  local job_file marker workdir
+  local dir
+
+  job_file="$(job_file_path "$job_id")"
+  [[ -f "$job_file" ]] || { printf '[]'; return; }
+  marker="$(job_marker_path "$job_id")"
+  [[ -f "$marker" ]] || marker="$job_file"
+  workdir="$(jq -r '.workdir // empty' "$job_file" 2>/dev/null || true)"
+  [[ -n "$workdir" ]] || workdir="${CHAT_WORKDIR:-$CODEX_WORKDIR}"
+
+  {
+    for dir in "$workdir/output" "$workdir/outputs" "$workdir/artifacts" "$workdir/tmp"; do
+      [[ -d "$dir" ]] || continue
+      find "$dir" -type f -newer "$marker" 2>/dev/null
+    done
+  } |
+    awk '!seen[$0]++' |
+    head -n 20 |
+    jq -R -s 'split("\n") | map(select(length > 0))'
+}
+
+job_refresh_artifacts() {
+  local job_id="$1"
+  local job_file tmp artifacts
+
+  job_file="$(job_file_path "$job_id")"
+  [[ -f "$job_file" ]] || return 0
+  artifacts="$(job_artifacts_json "$job_id")"
+  tmp="$job_file.$$"
+  jq --argjson artifacts "$artifacts" '.artifacts = $artifacts' "$job_file" >"$tmp"
+  mv "$tmp" "$job_file"
+}
+
+job_artifacts_text() {
+  local job_id="$1"
+  local job_file
+
+  job_file="$(job_file_path "$job_id")"
+  [[ -f "$job_file" ]] || return 0
+  job_refresh_artifacts "$job_id" || true
+  if ! jq -e '(.artifacts // []) | length > 0' "$job_file" >/dev/null 2>&1; then
+    printf '暂无记录。'
+    return
+  fi
+  jq -r '(.artifacts // [])[] | "- " + .' "$job_file"
+}
+
+job_summary_text() {
+  local job_id="${1:-}"
+  local job_file state prompt created updated timeout attempts session_id title artifacts last_error
+
+  job_id="$(resolve_job_ref "$job_id" || true)"
+  if [[ -z "$job_id" ]]; then
+    printf '还没有长任务记录。发送：长任务 <内容>'
+    return
+  fi
+
+  job_file="$(job_file_path "$job_id")"
+  job_refresh_artifacts "$job_id" || true
+  state="$(jq -r '.state // "unknown"' "$job_file")"
+  prompt="$(jq -r '.original_prompt // .prompt // ""' "$job_file" | compact_text 260)"
+  created="$(jq -r '.created_at // ""' "$job_file")"
+  updated="$(jq -r '.updated_at // ""' "$job_file")"
+  timeout="$(jq -r '.timeout_seconds // ""' "$job_file")"
+  attempts="$(jq -r '.attempts // 0' "$job_file")"
+  session_id="$(jq -r '.session_id // empty' "$job_file")"
+  last_error="$(jq -r '.last_error // empty' "$job_file" | compact_text 260)"
+  artifacts="$(job_artifacts_text "$job_id")"
+
+  printf '长任务\n'
+  printf '状态: %s\n' "$state"
+  printf 'ID: %s\n' "$job_id"
+  [[ -n "$created" ]] && printf '创建: %s\n' "$created"
+  [[ -n "$updated" ]] && printf '更新: %s\n' "$updated"
+  [[ -n "$timeout" ]] && printf '超时: %ss\n' "$timeout"
+  printf '尝试: %s\n' "$attempts"
+  if [[ -n "$session_id" ]]; then
+    title="$(session_title "$session_id")"
+    printf '会话: %s (%s)\n' "$title" "$(short_id "$session_id")"
+  fi
+  printf '\n任务:\n%s\n\n' "$prompt"
+  [[ -n "$last_error" ]] && printf '失败原因:\n%s\n\n' "$last_error"
+  printf '产物:\n%s\n\n' "$artifacts"
+  case "$state" in
+    failed|timeout|queued)
+      printf '下一步: 发送 继续任务'
+      ;;
+    running)
+      printf '下一步: 等待完成，或发送 status / logs 查看。'
+      ;;
+    completed)
+      printf '下一步: 如需继续迭代，发送 长任务 <新需求>。'
+      ;;
+  esac
+}
+
+job_continue_prompt() {
+  local job_id="$1"
+  local job_file original artifacts logs
+
+  job_file="$(job_file_path "$job_id")"
+  [[ -f "$job_file" ]] || return 1
+  original="$(jq -r '.original_prompt // .prompt // ""' "$job_file")"
+  artifacts="$(job_artifacts_text "$job_id")"
+  logs="$(recent_logs_text | compact_text 3000)"
+
+  cat <<EOF
+继续执行这个长任务。不要重做已经完成的部分；优先复用已生成的产物，从未完成的下一步开始。
+
+原始任务：
+$original
+
+已记录产物：
+$artifacts
+
+最近日志摘要：
+$logs
+
+请继续完成剩余步骤，并在最终回答里简洁说明已完成内容、产物路径、还有没有未完成项。
+EOF
+}
+
+fallback_continue_prompt() {
+  local previous_prompt logs
+
+  previous_prompt=""
+  if [[ -f "$STATUS_FILE" ]]; then
+    previous_prompt="$(jq -r '.prompt // empty' "$STATUS_FILE" 2>/dev/null || true)"
+  fi
+  logs="$(recent_logs_text | compact_text 3000)"
+
+  cat <<EOF
+继续执行当前会话里未完成的任务。不要重做已经完成的部分；优先从最近失败或中断的位置继续。
+
+上一条任务：
+${previous_prompt:-继续做任务}
+
+最近日志摘要：
+$logs
+
+请继续完成剩余步骤，并在最终回答里简洁说明已完成内容、产物路径、还有没有未完成项。
+EOF
+}
+
+long_task_failure_text() {
+  local job_id="$1"
+  local elapsed_seconds="${2:-0}"
+  local reason="${3:-长任务失败。}"
+  local summary artifacts
+
+  artifacts="$(job_artifacts_text "$job_id")"
+  summary="$(job_summary_text "$job_id")"
+  printf '长任务未完成。\n\n%s\n\n耗时：%ss\n\n已记录产物：\n%s\n\n发送 继续任务 可从这个任务继续。' \
+    "$reason" "$elapsed_seconds" "$artifacts"
+  if [[ "$CHAT_DEBUG" == "true" || "$OUTPUT_STYLE" == "verbose" ]]; then
+    printf '\n\n%s' "$summary"
+  fi
+}
+
+reply_job_status() {
+  local message_id="$1"
+  local job_ref="${2:-}"
+  local body
+
+  body="$(job_summary_text "$job_ref")"
+  reply_notice "$message_id" "长任务" "blue" "$body" "命令：长任务 <内容> / 继续任务 / logs" "$body"
+}
+
 queue_count() {
   find "$TASK_QUEUE_DIR" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '
 }
@@ -678,7 +981,7 @@ next_queue_file() {
 }
 
 pop_queue_task() {
-  local queue_file queued_json queued_task_id queued_message_id queued_prompt queued_session_id queued_reply_mode queued_chat_id queued_title
+  local queue_file queued_json queued_task_id queued_message_id queued_prompt queued_session_id queued_reply_mode queued_chat_id queued_title queued_timeout queued_job_id
 
   queue_file="$(next_queue_file)"
   [[ -n "$queue_file" && -f "$queue_file" ]] || return 1
@@ -692,14 +995,17 @@ pop_queue_task() {
   queued_session_id="$(jq -r '.session_id // empty' <<<"$queued_json")"
   queued_reply_mode="$(jq -r '.reply_mode // "final"' <<<"$queued_json")"
   queued_chat_id="$(jq -r '.chat_id // empty' <<<"$queued_json")"
+  queued_timeout="$(jq -r '.timeout_seconds // empty' <<<"$queued_json")"
+  queued_job_id="$(jq -r '.job_id // empty' <<<"$queued_json")"
 
   if [[ -z "$queued_task_id" || -z "$queued_message_id" || -z "$queued_prompt" ]]; then
     return 1
   fi
 
   [[ -n "$queued_chat_id" ]] || queued_chat_id="unknown"
+  [[ "$queued_timeout" =~ ^[0-9]+$ ]] || queued_timeout="$CODEX_TASK_TIMEOUT_SECONDS"
   chat_context_load "$queued_chat_id"
-  run_codex_task "$queued_task_id" "$queued_message_id" "$queued_prompt" "$queued_session_id" "$queued_reply_mode"
+  run_codex_task "$queued_task_id" "$queued_message_id" "$queued_prompt" "$queued_session_id" "$queued_reply_mode" "$queued_timeout" "$queued_job_id"
 }
 
 queue_watch_loop() {
@@ -748,8 +1054,11 @@ enqueue_task() {
   local session_id="${3:-}"
   local reply_mode="${4:-final}"
   local chat_id="${5:-${CHAT_ID:-unknown}}"
+  local timeout_seconds="${6:-$CODEX_TASK_TIMEOUT_SECONDS}"
+  local job_id="${7:-}"
   local task_id filename tmp
 
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds="$CODEX_TASK_TIMEOUT_SECONDS"
   task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
   filename="$TASK_QUEUE_DIR/$(perl -MTime::HiRes=time -e 'printf "%.6f", time' | tr -d .)-$$-$RANDOM.json"
   tmp="$filename.tmp"
@@ -760,8 +1069,10 @@ enqueue_task() {
     --arg prompt "$prompt" \
     --arg session_id "$session_id" \
     --arg reply_mode "$reply_mode" \
+    --arg job_id "$job_id" \
+    --argjson timeout_seconds "$timeout_seconds" \
     --arg queued_at "$(timestamp)" \
-    '{task_id:$task_id,message_id:$message_id,chat_id:$chat_id,prompt:$prompt,session_id:$session_id,reply_mode:$reply_mode,queued_at:$queued_at}' \
+    '{task_id:$task_id,message_id:$message_id,chat_id:$chat_id,prompt:$prompt,session_id:$session_id,reply_mode:$reply_mode,job_id:$job_id,timeout_seconds:$timeout_seconds,queued_at:$queued_at}' \
     >"$tmp"
   mv "$tmp" "$filename"
 
@@ -796,6 +1107,8 @@ queue_text() {
       printf '[%s] %s -> %s\n%s\n\n' "$index" "$queued_at" "$title" "$prompt"
     elif [[ "$reply_mode" == "new_session" ]]; then
       printf '[%s] %s -> 新会话\n%s\n\n' "$index" "$queued_at" "$prompt"
+    elif [[ "$reply_mode" == "long" ]]; then
+      printf '[%s] %s -> 长任务\n%s\n\n' "$index" "$queued_at" "$prompt"
     else
       printf '[%s] %s -> 新任务\n%s\n\n' "$index" "$queued_at" "$prompt"
     fi
@@ -1848,17 +2161,98 @@ start_new_session_task() {
   run_codex_task "$task_id" "$message_id" "$prompt" "" "new_session" &
 }
 
+start_long_task() {
+  local message_id="$1"
+  local prompt="$2"
+  local session_id="${3:-}"
+  local job_id task_id
+
+  [[ -n "$session_id" ]] || session_id="$(active_session_id || true)"
+  job_id="$(create_long_job "$message_id" "$prompt" "$session_id" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "long")"
+
+  if ! try_acquire_running_lock; then
+    enqueue_task "$message_id" "$prompt" "$session_id" "long" "${CHAT_ID:-unknown}" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id"
+    job_update_state "$job_id" "queued" "" "$message_id" "$prompt" "$session_id" "" "前面有任务正在运行，已排队。"
+    reply_notice "$message_id" "长任务已排队" "blue" "$(job_summary_text "$job_id")" "命令：任务 / 队列" "长任务已排队。发送 任务 查看。"
+    return
+  fi
+
+  task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
+  set_status "queued" "$task_id" "$message_id" "$prompt" "长任务已启动，超时 ${CODEX_LONG_TASK_TIMEOUT_SECONDS}s"
+  reply_notice "$message_id" "长任务已启动" "blue" "$(job_summary_text "$job_id")" "命令：任务 / logs / 继续任务" "长任务已启动。发送 任务 查看。"
+  run_codex_task "$task_id" "$message_id" "$prompt" "$session_id" "long" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id" &
+}
+
+continue_long_task() {
+  local message_id="$1"
+  local job_ref="${2:-}"
+  local job_id job_file state session_id prompt timeout_seconds task_id
+
+  job_id="$(resolve_job_ref "$job_ref" || true)"
+  if [[ -z "$job_id" ]]; then
+    session_id="$(active_session_id || true)"
+    if [[ -z "$session_id" ]]; then
+      reply_notice "$message_id" "没有可继续的长任务" "blue" "还没有长任务记录。发送：长任务 <内容>" "" "还没有长任务记录。发送：长任务 <内容>"
+      return
+    fi
+
+    prompt="$(fallback_continue_prompt)"
+    job_id="$(create_long_job "$message_id" "$prompt" "$session_id" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "long")"
+    if ! try_acquire_running_lock; then
+      enqueue_task "$message_id" "$prompt" "$session_id" "long" "${CHAT_ID:-unknown}" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id"
+      job_update_state "$job_id" "queued" "" "$message_id" "$prompt" "$session_id" "" "旧任务继续已升级为长任务并排队。"
+      reply_notice "$message_id" "继续任务已排队" "blue" "$(job_summary_text "$job_id")" "命令：任务 / 队列" "继续任务已排队。"
+      return
+    fi
+
+    task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
+    set_status "queued" "$task_id" "$message_id" "$prompt" "旧任务继续已升级为长任务"
+    reply_notice "$message_id" "继续长任务" "blue" "$(job_summary_text "$job_id")" "命令：任务 / logs" "正在继续长任务。"
+    run_codex_task "$task_id" "$message_id" "$prompt" "$session_id" "long" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id" &
+    return
+  fi
+
+  job_file="$(job_file_path "$job_id")"
+  state="$(jq -r '.state // empty' "$job_file")"
+  if [[ "$state" == "running" ]]; then
+    reply_notice "$message_id" "长任务运行中" "blue" "$(job_summary_text "$job_id")" "命令：任务 / logs" "长任务仍在运行。"
+    return
+  fi
+
+  session_id="$(jq -r '.session_id // empty' "$job_file")"
+  [[ -n "$session_id" ]] || session_id="$(active_session_id || true)"
+  timeout_seconds="$(jq -r ".timeout_seconds // $CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_file")"
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds="$CODEX_LONG_TASK_TIMEOUT_SECONDS"
+  prompt="$(job_continue_prompt "$job_id")"
+
+  if ! try_acquire_running_lock; then
+    enqueue_task "$message_id" "$prompt" "$session_id" "long" "${CHAT_ID:-unknown}" "$timeout_seconds" "$job_id"
+    job_update_state "$job_id" "queued" "" "$message_id" "$prompt" "$session_id" "" "继续任务已排队。"
+    reply_notice "$message_id" "继续任务已排队" "blue" "$(job_summary_text "$job_id")" "命令：任务 / 队列" "继续任务已排队。"
+    return
+  fi
+
+  task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
+  set_status "queued" "$task_id" "$message_id" "$prompt" "正在继续长任务"
+  reply_notice "$message_id" "继续长任务" "blue" "$(job_summary_text "$job_id")" "命令：任务 / logs" "正在继续长任务。"
+  run_codex_task "$task_id" "$message_id" "$prompt" "$session_id" "long" "$timeout_seconds" "$job_id" &
+}
+
 run_codex_task() {
   local task_id="$1"
   local message_id="$2"
   local prompt="$3"
   local session_id="${4:-}"
   local reply_mode="${5:-final}"
+  local timeout_seconds="${6:-$CODEX_TASK_TIMEOUT_SECONDS}"
+  local job_id="${7:-}"
   local output_file codex_exit codex_pid
   local started_epoch started_ms elapsed_seconds
   local resume_args=()
   local new_session_id
+  local failure_answer failure_reason
 
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds="$CODEX_TASK_TIMEOUT_SECONDS"
   started_epoch="$(date '+%s')"
   started_ms=$((started_epoch * 1000))
   output_file="$(mktemp -t lark-codex-output.XXXXXX)"
@@ -1868,11 +2262,14 @@ run_codex_task() {
   else
     set_status "running" "$task_id" "$message_id" "$prompt" "Codex 正在执行"
   fi
+  [[ -n "$job_id" ]] && job_update_state "$job_id" "running" "$task_id" "$message_id" "$prompt" "$session_id" "" ""
 
   {
     echo "$(timestamp) task_id=$task_id started"
     echo "model=$CODEX_MODEL"
     echo "workdir=${CHAT_WORKDIR:-$CODEX_WORKDIR}"
+    echo "timeout=${timeout_seconds}s"
+    [[ -n "$job_id" ]] && echo "job_id=$job_id"
     [[ -n "$session_id" ]] && echo "resume_session=$session_id"
     echo
   } >>"$TASK_LOG_FILE"
@@ -1893,7 +2290,7 @@ run_codex_task() {
     ) >>"$TASK_LOG_FILE" 2>&1 &
     codex_pid=$!
     write_running_lock_pid "$codex_pid"
-    if wait_with_timeout "$codex_pid"; then
+    if wait_with_timeout "$codex_pid" "$timeout_seconds"; then
       codex_exit=0
     else
       codex_exit=$?
@@ -1911,10 +2308,19 @@ run_codex_task() {
     ) >>"$TASK_LOG_FILE" 2>&1 &
     codex_pid=$!
     write_running_lock_pid "$codex_pid"
-    if wait_with_timeout "$codex_pid"; then
+    if wait_with_timeout "$codex_pid" "$timeout_seconds"; then
       codex_exit=0
     else
       codex_exit=$?
+    fi
+  fi
+
+  if [[ -n "$job_id" && -z "$session_id" ]]; then
+    new_session_id="$(latest_created_session_id_since "$started_ms" "${CHAT_WORKDIR:-$CODEX_WORKDIR}" || true)"
+    if [[ -n "$new_session_id" ]]; then
+      session_id="$new_session_id"
+      job_update_state "$job_id" "running" "$task_id" "$message_id" "$prompt" "$session_id" "" ""
+      echo "$(timestamp) task_id=$task_id job_session=$session_id" >>"$TASK_LOG_FILE"
     fi
   fi
 
@@ -1935,12 +2341,26 @@ run_codex_task() {
     echo "$(timestamp) task_id=$task_id completed" >>"$TASK_LOG_FILE"
     set_status "completed" "$task_id" "$message_id" "$prompt" "已回复结果"
     elapsed_seconds=$(($(date '+%s') - started_epoch))
+    if [[ -n "$job_id" ]]; then
+      job_refresh_artifacts "$job_id" || true
+      job_update_state "$job_id" "completed" "$task_id" "$message_id" "$prompt" "$session_id" "$elapsed_seconds" ""
+    fi
     reply_result "$message_id" "success" "$answer" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" || echo "Failed to reply to $message_id" >&2
   else
     echo "$(timestamp) task_id=$task_id failed" >>"$TASK_LOG_FILE"
     set_status "failed" "$task_id" "$message_id" "$prompt" "发送 logs 查看最近日志"
     elapsed_seconds=$(($(date '+%s') - started_epoch))
-    reply_result "$message_id" "failed" "Codex failed while handling this request." "$task_id" "$prompt" "$session_id" "$elapsed_seconds" || true
+    failure_reason="Codex failed while handling this request."
+    if ((codex_exit == 124)); then
+      failure_reason="任务超过 ${timeout_seconds}s，已自动暂停。"
+    fi
+    failure_answer="$failure_reason"
+    if [[ -n "$job_id" ]]; then
+      job_refresh_artifacts "$job_id" || true
+      job_update_state "$job_id" "failed" "$task_id" "$message_id" "$prompt" "$session_id" "$elapsed_seconds" "$failure_reason"
+      failure_answer="$(long_task_failure_text "$job_id" "$elapsed_seconds" "$failure_reason")"
+    fi
+    reply_result "$message_id" "failed" "$failure_answer" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" || true
   fi
 
   rm -f "$output_file"
@@ -1997,7 +2417,7 @@ while IFS= read -r line; do
       continue
       ;;
     help|帮助)
-      reply_notice "$message_id" "命令" "blue" "普通消息：发送到当前会话（未绑定会话时创建新任务）\n\n核心：目录 / 切换 N / 清除会话 / 新会话 / 新会话 <内容> / 会话 N / 同步会话 N 10分钟 / 停止同步\n\n终端：cd /path / pwd\n\n诊断：status / logs / 队列 / debug on|off" "" "发送 help 查看命令"
+      reply_notice "$message_id" "命令" "blue" "普通消息：发送到当前会话（未绑定会话时创建新任务）\n\n核心：目录 / 切换 N / 清除会话 / 新会话 / 新会话 <内容> / 会话 N / 同步会话 N 10分钟 / 停止同步\n\n长任务：长任务 <内容> / 任务 / 继续任务\n\n终端：cd /path / pwd\n\n诊断：status / logs / 队列 / debug on|off" "" "发送 help 查看命令"
       continue
       ;;
     目录|会话目录|sessions|"session list")
@@ -2038,6 +2458,22 @@ while IFS= read -r line; do
 
   if [[ "$prompt" =~ ^(update|更新)([[:space:]]+(.+))?$ ]]; then
     cmd_update_mode "$message_id" "${BASH_REMATCH[3]:-}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(任务|task|job|jobs)([[:space:]]+(.+))?$ ]]; then
+    reply_job_status "$message_id" "${BASH_REMATCH[3]:-}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(继续任务|继续做任务|继续长任务|continue[[:space:]]+task|resume[[:space:]]+task)([[:space:]]+(.+))?$ ]]; then
+    continue_long_task "$message_id" "${BASH_REMATCH[3]:-}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(长任务|long[[:space:]]+task|long)[[:space:]]+(.+)$ ]]; then
+    prompt="${BASH_REMATCH[2]}"
+    start_long_task "$message_id" "$prompt"
     continue
   fi
 

@@ -1,6 +1,6 @@
 # lark-codex-bridge
 
-用飞书/Lark 机器人在手机上远程控制本机 Codex CLI。普通消息会触发 Codex，机器人先回复 `👀` 表示收到，任务完成后回复 `✅ 完成` 和最终结果。
+用飞书/Lark 机器人在手机上远程控制本机 Codex CLI。普通消息会触发 Codex，机器人优先给原消息添加 `OK` 表情表示收到，任务完成后优先回复结构化交互卡片；如果权限或卡片发送失败，会自动退回纯文本。
 
 > 安全提醒：这个桥接会让指定飞书/Lark 用户远程触发你电脑上的 Codex。公开版默认不开启高权限 bypass。只有你显式设置 `LARK_CODEX_DANGEROUS_BYPASS=true` 时，续接会话才会使用 `--dangerously-bypass-approvals-and-sandbox`。
 
@@ -9,8 +9,10 @@
 - 直接发消息给机器人，让 Codex 执行任务。
 - 忙时自动排队。
 - 查看 Codex 会话目录，并用编号选择会话。
+- `切换 1` 后常驻绑定本地 Codex 会话，普通消息会无缝进入当前会话。
 - 同步会话进度，像手机上的轻量终端流。
 - 在同步期间直接给当前会话继续发消息。
+- 结果和会话目录优先使用飞书/Lark 交互卡片展示。
 - 支持 `screen` 后台运行。
 
 ## 依赖
@@ -58,6 +60,12 @@ LARK_CODEX_ALLOWED_SENDER=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 5. 发布/启用应用，并把机器人添加到你要使用的会话里。
 6. 获取你的用户 `open_id`，填入 `LARK_CODEX_ALLOWED_SENDER`。
 
+权限建议：
+
+- 基础体验：接收消息、以机器人身份回复消息。
+- 完整体验：再添加 `im:message.reactions:write_only`，用于收到消息后添加 `OK` 表情。
+- 交互卡片通过消息回复发送；如果卡片发送失败，桥接会自动退回纯文本回复。
+
 ## 启动和停止
 
 ```bash
@@ -90,7 +98,31 @@ status
 目录
 ```
 
-列出当前可用 Codex 会话编号。
+用卡片列出当前会话、置顶会话和最近会话编号。
+
+```text
+切换 1
+```
+
+把编号 `1` 设置为当前会话。之后普通消息会一直进入这个会话，直到再次切换或清除。
+
+```text
+当前会话
+```
+
+查看当前绑定的本地 Codex 会话。
+
+```text
+清除会话
+```
+
+取消当前会话绑定。之后普通消息会创建新任务。
+
+```text
+新任务 帮我整理这个仓库
+```
+
+绕过当前会话，强制创建一个新的 Codex 任务。
 
 ```text
 会话 1
@@ -102,7 +134,7 @@ status
 同步会话 1 10分钟
 ```
 
-附着到编号 `1` 的会话并同步 10 分钟。同步期间，直接发送普通消息会进入这个会话。
+同步编号 `1` 的输出 10 分钟。同步只是进度流；普通消息路由由当前会话绑定决定。
 
 ```text
 切换 2
@@ -137,6 +169,10 @@ LARK_CODEX_BASE_DIR=$HOME/.lark-codex
 LARK_CODEX_WORKDIR=$HOME
 LARK_CODEX_MODEL=gpt-5.2
 LARK_CODEX_ACK_EMOJI=👀
+LARK_CODEX_ACK_MODE=reaction
+LARK_CODEX_ACK_REACTION_EMOJI=OK
+LARK_CODEX_RESULT_FORMAT=card
+LARK_CODEX_DIRECTORY_FORMAT=card
 LARK_CODEX_TASK_TIMEOUT_SECONDS=900
 LARK_CODEX_DANGEROUS_BYPASS=false
 ```
@@ -171,7 +207,7 @@ LARK_CODEX_DANGEROUS_BYPASS=true
 
 # English
 
-Control your local Codex CLI from a Feishu/Lark bot on your phone. A normal message triggers Codex, the bot replies `👀` as an acknowledgement, then sends `✅ Done` with the final result when the task completes.
+Control your local Codex CLI from a Feishu/Lark bot on your phone. A normal message triggers Codex. The bot first tries to add an `OK` reaction to the original message, then sends a structured interactive card when the task completes. If reactions or cards are unavailable, it falls back to plain text.
 
 > Security note: this bridge lets one configured Feishu/Lark user remotely trigger Codex on your computer. Dangerous bypass mode is off by default. It is only enabled when you explicitly set `LARK_CODEX_DANGEROUS_BYPASS=true`.
 
@@ -180,8 +216,10 @@ Control your local Codex CLI from a Feishu/Lark bot on your phone. A normal mess
 - Send normal bot messages to run Codex tasks.
 - Automatic queueing while Codex is busy.
 - List Codex sessions and refer to them by number.
+- Keep one local Codex session attached with `切换 1`, so normal messages flow into that session.
 - Follow a session like a lightweight terminal stream.
 - Send follow-up messages into the attached session.
+- Display results and session directories as Feishu/Lark cards when possible.
 - Run in the background with `screen`.
 
 ## Requirements
@@ -229,6 +267,12 @@ LARK_CODEX_ALLOWED_SENDER=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 5. Publish/enable the app and add the bot to your chat.
 6. Put your user `open_id` into `LARK_CODEX_ALLOWED_SENDER`.
 
+Permission guide:
+
+- Basic: receive messages and reply as the bot.
+- Enhanced: also add `im:message.reactions:write_only` for the `OK` acknowledgement reaction.
+- Interactive cards are sent as message replies. If card sending fails, the bridge falls back to plain text.
+
 ## Start and Stop
 
 ```bash
@@ -253,8 +297,12 @@ Send these to your Feishu/Lark bot:
 
 - `status`: show bridge status.
 - `目录` or `sessions`: list Codex sessions.
+- `切换 1`: set session `1` as the persistent current session.
+- `当前会话` or `current`: show the current target session.
+- `清除会话` or `detach`: clear the current target session.
+- `新任务 <content>` or `new <content>`: force a new Codex task instead of using the current session.
 - `会话 1`: show recent progress for session `1`.
-- `同步会话 1 10分钟`: attach and stream session `1` for 10 minutes.
+- `同步会话 1 10分钟`: stream session `1` for 10 minutes.
 - `切换 2`: switch the attached stream to session `2`.
 - `停止同步`: stop streaming.
 - `队列`: show queued messages.

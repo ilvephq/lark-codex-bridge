@@ -41,6 +41,7 @@ TASK_LOG_FILE=""
 SESSION_ALIAS_FILE=""
 PINNED_SESSIONS_FILE=""
 ACTIVE_SESSION_FILE=""
+NEW_SESSION_FILE=""
 SYNC_FILE=""
 SYNC_STOP_FILE=""
 SYNC_LOCK_DIR=""
@@ -253,6 +254,7 @@ chat_context_load() {
   SESSION_ALIAS_FILE="$CHAT_STATE_DIR/session_aliases.tsv"
   PINNED_SESSIONS_FILE="$CHAT_STATE_DIR/pinned_sessions.txt"
   ACTIVE_SESSION_FILE="$CHAT_STATE_DIR/active_session.json"
+  NEW_SESSION_FILE="$CHAT_STATE_DIR/new_session_pending.json"
   SYNC_FILE="$CHAT_STATE_DIR/sync.json"
   SYNC_STOP_FILE="$CHAT_STATE_DIR/sync.stop"
   SYNC_LOCK_DIR="$CHAT_STATE_DIR/sync.lock"
@@ -716,7 +718,7 @@ enqueue_task() {
 }
 
 queue_text() {
-  local count file index prompt session_id title queued_at chat_id chat_filter matched
+  local count file index prompt session_id title queued_at chat_id chat_filter matched reply_mode
   local total
 
   total="$(queue_count)"
@@ -736,10 +738,13 @@ queue_text() {
     fi
     prompt="$(jq -r '.prompt // ""' "$file" | compact_text 80)"
     session_id="$(jq -r '.session_id // empty' "$file")"
+    reply_mode="$(jq -r '.reply_mode // "final"' "$file")"
     queued_at="$(jq -r '.queued_at // ""' "$file")"
     if [[ -n "$session_id" ]]; then
       title="$(session_title "$session_id")"
       printf '[%s] %s -> %s\n%s\n\n' "$index" "$queued_at" "$title" "$prompt"
+    elif [[ "$reply_mode" == "new_session" ]]; then
+      printf '[%s] %s -> 新会话\n%s\n\n' "$index" "$queued_at" "$prompt"
     else
       printf '[%s] %s -> 新任务\n%s\n\n' "$index" "$queued_at" "$prompt"
     fi
@@ -856,6 +861,14 @@ valid_session_ref() {
   [[ "$1" =~ ^#?[A-Za-z0-9-]{1,80}$ ]]
 }
 
+sql_string_literal() {
+  local value="$1"
+  local escaped
+
+  escaped="$(printf '%s' "$value" | sed "s/'/''/g")"
+  printf "'%s'" "$escaped"
+}
+
 session_db_row() {
   local session_id="$1"
 
@@ -888,6 +901,32 @@ session_title() {
   fi
 
   printf '%s' "$1"
+}
+
+latest_created_session_id_since() {
+  local started_ms="$1"
+  local cwd="${2:-${CHAT_WORKDIR:-$CODEX_WORKDIR}}"
+  local cwd_sql threshold
+
+  [[ -f "$CODEX_STATE_DB" ]] || return 1
+  [[ "$started_ms" =~ ^[0-9]+$ ]] || return 1
+
+  # Allow a small clock/commit margin around Codex's sqlite write.
+  threshold=$((started_ms - 10000))
+  if ((threshold < 0)); then
+    threshold=0
+  fi
+  cwd_sql="$(sql_string_literal "$cwd")"
+
+  sqlite3 -tabs -noheader "$CODEX_STATE_DB" "
+    select id
+    from threads
+    where archived = 0
+      and cwd = $cwd_sql
+      and coalesce(created_at_ms, created_at * 1000, updated_at_ms, updated_at * 1000, 0) >= $threshold
+    order by coalesce(created_at_ms, created_at * 1000, updated_at_ms, updated_at * 1000, 0) desc
+    limit 1;
+  " | head -n 1
 }
 
 session_alias_number() {
@@ -1074,6 +1113,7 @@ set_active_session() {
     --argjson persistent true \
     '{session_id:$session_id,title:$title,started_at:$started_at,expires_at:$expires_at,persistent:$persistent}' \
     >"$ACTIVE_SESSION_FILE"
+  clear_new_session_pending
 }
 
 active_session_id() {
@@ -1087,6 +1127,22 @@ active_session_id() {
   fi
 
   return 1
+}
+
+set_new_session_pending() {
+  jq -n \
+    --arg started_at "$(timestamp)" \
+    '{pending:true,started_at:$started_at}' \
+    >"$NEW_SESSION_FILE"
+  rm -f "$ACTIVE_SESSION_FILE"
+}
+
+clear_new_session_pending() {
+  rm -f "$NEW_SESSION_FILE"
+}
+
+new_session_pending() {
+  [[ -f "$NEW_SESSION_FILE" ]]
 }
 
 active_session_remaining_seconds() {
@@ -1200,6 +1256,7 @@ detach_active_session() {
   local message_id="$1"
 
   rm -f "$ACTIVE_SESSION_FILE"
+  clear_new_session_pending
   reply_notice "$message_id" "✅ 已清除会话" "green" "后续普通消息会创建新任务。" "命令：目录 / 切换 N / 新任务 <内容>" "✅ 已清除当前会话。后续普通消息会创建新任务。"
 }
 
@@ -1724,6 +1781,22 @@ stop_sync() {
   reply_notice "$message_id" "收到" "blue" "正在停止同步（会话常驻不变）。" "" "收到，正在停止同步（会话常驻不变）。"
 }
 
+start_new_session_task() {
+  local message_id="$1"
+  local prompt="$2"
+  local task_id
+
+  clear_new_session_pending
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    enqueue_task "$message_id" "$prompt" "" "new_session"
+    return
+  fi
+
+  task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
+  set_status "queued" "$task_id" "$message_id" "$prompt" "将创建新会话并常驻"
+  run_codex_task "$task_id" "$message_id" "$prompt" "" "new_session" &
+}
+
 run_codex_task() {
   local task_id="$1"
   local message_id="$2"
@@ -1731,10 +1804,12 @@ run_codex_task() {
   local session_id="${4:-}"
   local reply_mode="${5:-final}"
   local output_file codex_exit codex_pid
-  local started_epoch elapsed_seconds
+  local started_epoch started_ms elapsed_seconds
   local resume_args=()
+  local new_session_id
 
   started_epoch="$(date '+%s')"
+  started_ms=$((started_epoch * 1000))
   output_file="$(mktemp -t lark-codex-output.XXXXXX)"
   : >"$TASK_LOG_FILE"
   if [[ -n "$session_id" ]]; then
@@ -1794,6 +1869,16 @@ run_codex_task() {
     local answer
     answer="$(cat "$output_file")"
     [[ -n "$answer" ]] || answer="Codex finished, but did not return a final message."
+    if [[ "$reply_mode" == "new_session" && -z "$session_id" ]]; then
+      new_session_id="$(latest_created_session_id_since "$started_ms" "${CHAT_WORKDIR:-$CODEX_WORKDIR}" || true)"
+      if [[ -n "$new_session_id" ]]; then
+        session_id="$new_session_id"
+        set_active_session "$session_id"
+        echo "$(timestamp) task_id=$task_id new_session=$session_id" >>"$TASK_LOG_FILE"
+      else
+        echo "$(timestamp) task_id=$task_id warning=new_session_id_not_found" >>"$TASK_LOG_FILE"
+      fi
+    fi
     echo "$(timestamp) task_id=$task_id completed" >>"$TASK_LOG_FILE"
     set_status "completed" "$task_id" "$message_id" "$prompt" "已回复结果"
     elapsed_seconds=$(($(date '+%s') - started_epoch))
@@ -1859,7 +1944,7 @@ while IFS= read -r line; do
       continue
       ;;
     help|帮助)
-      reply_notice "$message_id" "命令" "blue" "普通消息：发送到当前会话（未绑定会话时创建新任务）\n\n核心：目录 / 切换 N / 清除会话 / 会话 N / 同步会话 N 10分钟 / 停止同步\n\n终端：cd /path / pwd\n\n诊断：status / logs / 队列 / debug on|off" "" "发送 help 查看命令"
+      reply_notice "$message_id" "命令" "blue" "普通消息：发送到当前会话（未绑定会话时创建新任务）\n\n核心：目录 / 切换 N / 清除会话 / 新会话 / 新会话 <内容> / 会话 N / 同步会话 N 10分钟 / 停止同步\n\n终端：cd /path / pwd\n\n诊断：status / logs / 队列 / debug on|off" "" "发送 help 查看命令"
       continue
       ;;
     目录|会话目录|sessions|"session list")
@@ -1900,6 +1985,24 @@ while IFS= read -r line; do
 
   if [[ "$prompt" =~ ^(update|更新)([[:space:]]+(.+))?$ ]]; then
     cmd_update_mode "$message_id" "${BASH_REMATCH[3]:-}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(新会话|新对话|new[[:space:]]+session|new[[:space:]]+chat)$ ]]; then
+    set_new_session_pending
+    reply_notice "$message_id" "新会话" "blue" "已准备创建新会话。下一条普通消息会创建并常驻到这个新会话。" "命令：清除会话 可取消当前常驻；切换 N 可切到已有会话。" "已准备创建新会话。下一条普通消息会创建并常驻到这个新会话。"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(新会话|新对话)[[:space:]]+(.+)$ ]]; then
+    prompt="${BASH_REMATCH[2]}"
+    start_new_session_task "$message_id" "$prompt"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(new[[:space:]]+session|new[[:space:]]+chat)[[:space:]]+(.+)$ ]]; then
+    prompt="${BASH_REMATCH[2]}"
+    start_new_session_task "$message_id" "$prompt"
     continue
   fi
 
@@ -1978,6 +2081,7 @@ while IFS= read -r line; do
 
   if [[ "$prompt" =~ ^(新任务|new)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
+    clear_new_session_pending
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
       enqueue_task "$message_id" "$prompt" "" "final"
       continue
@@ -1986,6 +2090,11 @@ while IFS= read -r line; do
     task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
     set_status "queued" "$task_id" "$message_id" "$prompt" "已进入后台执行"
     run_codex_task "$task_id" "$message_id" "$prompt" &
+    continue
+  fi
+
+  if new_session_pending; then
+    start_new_session_task "$message_id" "$prompt"
     continue
   fi
 

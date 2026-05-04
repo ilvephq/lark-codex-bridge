@@ -130,7 +130,19 @@ status
 新任务 帮我整理这个仓库
 ```
 
-绕过当前会话，强制创建一个新的 Codex 任务。
+绕过当前会话，强制创建一个新的 Codex 任务，但不把它设为常驻会话。
+
+```text
+新会话 帮我整理这个仓库
+```
+
+创建一个新的 Codex 会话，任务完成后自动把它设为当前常驻会话。
+
+```text
+新会话
+```
+
+进入新会话待命状态。下一条普通消息会创建新的 Codex 会话，并自动常驻到这个新会话。
 
 ```text
 会话 1
@@ -339,6 +351,8 @@ Send these to your Feishu/Lark bot:
 - `当前会话` or `current`: show the current target session.
 - `清除会话` or `detach`: clear the current target session.
 - `新任务 <content>` or `new <content>`: force a new Codex task instead of using the current session.
+- `新会话 <content>` / `new session <content>`: create a new Codex session and make it the persistent current session.
+- `新会话` / `new session`: make the next normal message create and attach a new session.
 - `会话 1`: show recent progress for session `1`.
 - `同步会话 1 10分钟`: stream session `1` for 10 minutes (only pushes when new events; no periodic keepalive).
 - `切换 2`: switch the attached stream to session `2`.

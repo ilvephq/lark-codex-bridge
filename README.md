@@ -104,7 +104,13 @@ status
 切换 1
 ```
 
-把编号 `1` 设置为当前会话。之后普通消息会一直进入这个会话，直到再次切换或清除。
+把编号 `1` 设为当前“常驻会话”。之后普通消息会一直进入这个会话，直到再次切换或清除。
+
+也支持别名：
+
+```text
+常驻 1
+```
 
 ```text
 当前会话
@@ -134,7 +140,7 @@ status
 同步会话 1 10分钟
 ```
 
-同步编号 `1` 的输出 10 分钟。同步只是进度流；普通消息路由由当前会话绑定决定。
+同步编号 `1` 的输出 10 分钟。同步只在有新事件时推送，不会定期刷屏。
 
 ```text
 切换 2
@@ -173,6 +179,8 @@ LARK_CODEX_ACK_MODE=reaction
 LARK_CODEX_ACK_REACTION_EMOJI=OK
 LARK_CODEX_RESULT_FORMAT=card
 LARK_CODEX_DIRECTORY_FORMAT=card
+LARK_CODEX_OUTPUT_STYLE=compact
+LARK_CODEX_DIRECTORY_LIMIT=12
 LARK_CODEX_TASK_TIMEOUT_SECONDS=900
 LARK_CODEX_DANGEROUS_BYPASS=false
 ```
@@ -297,12 +305,12 @@ Send these to your Feishu/Lark bot:
 
 - `status`: show bridge status.
 - `目录` or `sessions`: list Codex sessions.
-- `切换 1`: set session `1` as the persistent current session.
+- `切换 1` / `常驻 1`: set session `1` as the persistent current session.
 - `当前会话` or `current`: show the current target session.
 - `清除会话` or `detach`: clear the current target session.
 - `新任务 <content>` or `new <content>`: force a new Codex task instead of using the current session.
 - `会话 1`: show recent progress for session `1`.
-- `同步会话 1 10分钟`: stream session `1` for 10 minutes.
+- `同步会话 1 10分钟`: stream session `1` for 10 minutes (only pushes when new events; no periodic keepalive).
 - `切换 2`: switch the attached stream to session `2`.
 - `停止同步`: stop streaming.
 - `队列`: show queued messages.

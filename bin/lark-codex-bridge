@@ -7,6 +7,7 @@ CODEX_WORKDIR="${LARK_CODEX_WORKDIR:-$HOME}"
 COMMAND_PREFIX="${LARK_CODEX_COMMAND_PREFIX:-/codex}"
 ALLOWED_SENDER="${LARK_CODEX_ALLOWED_SENDER:-}"
 MAX_REPLY_CHARS="${LARK_CODEX_MAX_REPLY_CHARS:-12000}"
+OUTPUT_LIMIT_CHARS_DEFAULT="${LARK_CODEX_OUTPUT_LIMIT_CHARS:-$MAX_REPLY_CHARS}"
 LOG_FILE="${LARK_CODEX_LOG_FILE:-$BASE_DIR/bridge.log}"
 CODEX_MODEL="${LARK_CODEX_MODEL:-gpt-5.2}"
 CODEX_BIN="${LARK_CODEX_BIN:-codex}"
@@ -17,14 +18,12 @@ ACK_REACTION_EMOJI="${LARK_CODEX_ACK_REACTION_EMOJI:-OK}"
 RESULT_FORMAT="${LARK_CODEX_RESULT_FORMAT:-card}"
 DIRECTORY_FORMAT="${LARK_CODEX_DIRECTORY_FORMAT:-card}"
 OUTPUT_STYLE="${LARK_CODEX_OUTPUT_STYLE:-compact}"
+CARD_SCHEMA="${LARK_CODEX_CARD_SCHEMA:-2}"
+SYNC_RENDER_DEFAULT="${LARK_CODEX_SYNC_RENDER:-stream}"
+ENABLE_MESSAGE_UPDATE_DEFAULT="${LARK_CODEX_ENABLE_MESSAGE_UPDATE:-false}"
 STATE_DIR="${LARK_CODEX_STATE_DIR:-$BASE_DIR/state}"
-STATUS_FILE="$STATE_DIR/status.json"
-TASK_LOG_FILE="$STATE_DIR/current.log"
 LOCK_DIR="$STATE_DIR/running.lock"
 TASK_QUEUE_DIR="$STATE_DIR/queue"
-SYNC_FILE="$STATE_DIR/sync.json"
-SYNC_STOP_FILE="$STATE_DIR/sync.stop"
-SYNC_LOCK_DIR="$STATE_DIR/sync.lock"
 SYNC_INTERVAL_SECONDS="${LARK_CODEX_SYNC_INTERVAL_SECONDS:-60}"
 SESSION_STREAM_INTERVAL_SECONDS="${LARK_CODEX_SESSION_STREAM_INTERVAL_SECONDS:-8}"
 SYNC_MAX_SECONDS="${LARK_CODEX_SYNC_MAX_SECONDS:-3600}"
@@ -32,9 +31,28 @@ DIRECTORY_LIMIT="${LARK_CODEX_DIRECTORY_LIMIT:-12}"
 CODEX_SESSIONS_ROOT="${LARK_CODEX_SESSIONS_ROOT:-$HOME/.codex/sessions}"
 CODEX_STATE_DB="${LARK_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
 LARK_CODEX_DANGEROUS_BYPASS="${LARK_CODEX_DANGEROUS_BYPASS:-false}"
-SESSION_ALIAS_FILE="$STATE_DIR/session_aliases.tsv"
-PINNED_SESSIONS_FILE="$STATE_DIR/pinned_sessions.txt"
-ACTIVE_SESSION_FILE="$STATE_DIR/active_session.json"
+
+CHATS_DIR="$STATE_DIR/chats"
+CHAT_ID=""
+CHAT_STATE_DIR=""
+SETTINGS_FILE=""
+STATUS_FILE=""
+TASK_LOG_FILE=""
+SESSION_ALIAS_FILE=""
+PINNED_SESSIONS_FILE=""
+ACTIVE_SESSION_FILE=""
+SYNC_FILE=""
+SYNC_STOP_FILE=""
+SYNC_LOCK_DIR=""
+CHAT_WORKDIR=""
+CHAT_OUTPUT_LIMIT_CHARS=""
+CHAT_DEBUG=""
+CHAT_SYNC_RENDER=""
+CHAT_ENABLE_MESSAGE_UPDATE=""
+SYNC_SCREEN_MODE="false"
+SYNC_SCREEN_MESSAGE_ID=""
+SYNC_SCREEN_BUFFER_FILE=""
+SYNC_SCREEN_MAX_LINES="${LARK_CODEX_SYNC_SCREEN_MAX_LINES:-180}"
 
 if [[ "$OUTPUT_STYLE" != "compact" && "$OUTPUT_STYLE" != "verbose" ]]; then
   OUTPUT_STYLE="compact"
@@ -57,6 +75,7 @@ source "$CRED_FILE"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 mkdir -p "$STATE_DIR"
+mkdir -p "$CHATS_DIR"
 mkdir -p "$TASK_QUEUE_DIR"
 exec >>"$LOG_FILE" 2>&1
 
@@ -96,7 +115,7 @@ refresh_tenant_token() {
 
 truncate_reply_text() {
   local text="$1"
-  local max="${2:-$MAX_REPLY_CHARS}"
+  local max="${2:-${CHAT_OUTPUT_LIMIT_CHARS:-$MAX_REPLY_CHARS}}"
 
   if ((${#text} > max)); then
     printf '%s\n\n[output truncated]' "${text:0:max}"
@@ -120,6 +139,176 @@ short_id() {
   first="${id:0:8}"
   last="${id#${id%????}}"
   printf '%s...%s' "$first" "$last"
+}
+
+safe_fs_id() {
+  local id="$1"
+
+  id="${id//[^A-Za-z0-9._-]/_}"
+  [[ -n "$id" ]] || id="_"
+  printf '%s' "$id"
+}
+
+expand_path() {
+  local path="$1"
+
+  if [[ "$path" == "~" ]]; then
+    printf '%s' "$HOME"
+    return 0
+  fi
+  if [[ "$path" == "~/"* ]]; then
+    printf '%s/%s' "$HOME" "${path#~/}"
+    return 0
+  fi
+  printf '%s' "$path"
+}
+
+chat_settings_ensure() {
+  local limit sync_render enable_update enable_bool
+
+  [[ -n "$SETTINGS_FILE" ]] || return 1
+  [[ -f "$SETTINGS_FILE" ]] && return 0
+
+  limit="$OUTPUT_LIMIT_CHARS_DEFAULT"
+  [[ "$limit" =~ ^[0-9]+$ ]] || limit="$MAX_REPLY_CHARS"
+  sync_render="$SYNC_RENDER_DEFAULT"
+  enable_update="$ENABLE_MESSAGE_UPDATE_DEFAULT"
+  enable_bool="false"
+  [[ "$enable_update" == "true" ]] && enable_bool="true"
+
+  jq -n \
+    --arg workdir "$CODEX_WORKDIR" \
+    --argjson output_limit_chars "$limit" \
+    --arg sync_render "$sync_render" \
+    --argjson debug false \
+    --argjson enable_message_update "$enable_bool" \
+    '{
+      workdir: $workdir,
+      output_limit_chars: $output_limit_chars,
+      debug: $debug,
+      sync_render: $sync_render,
+      enable_message_update: $enable_message_update
+    }' >"$SETTINGS_FILE"
+}
+
+chat_settings_load_into_vars() {
+  local workdir limit debug sync_render enable_update
+
+  [[ -f "$SETTINGS_FILE" ]] || return 1
+  workdir="$(jq -r '.workdir // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+  limit="$(jq -r '.output_limit_chars // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+  debug="$(jq -r '.debug // false' "$SETTINGS_FILE" 2>/dev/null || true)"
+  sync_render="$(jq -r '.sync_render // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+  enable_update="$(jq -r '.enable_message_update // empty' "$SETTINGS_FILE" 2>/dev/null || true)"
+
+  [[ -n "$workdir" ]] || workdir="$CODEX_WORKDIR"
+  [[ "$limit" =~ ^[0-9]+$ ]] || limit="$OUTPUT_LIMIT_CHARS_DEFAULT"
+  [[ "$debug" == "true" || "$debug" == "false" ]] || debug="false"
+  case "$sync_render" in
+    stream|screen) ;;
+    *) sync_render="$SYNC_RENDER_DEFAULT" ;;
+  esac
+  [[ "$enable_update" == "true" || "$enable_update" == "false" ]] || enable_update="$ENABLE_MESSAGE_UPDATE_DEFAULT"
+
+  CHAT_WORKDIR="$workdir"
+  CHAT_OUTPUT_LIMIT_CHARS="$limit"
+  CHAT_DEBUG="$debug"
+  CHAT_SYNC_RENDER="$sync_render"
+  CHAT_ENABLE_MESSAGE_UPDATE="$enable_update"
+}
+
+chat_settings_set() {
+  local key="$1"
+  local value="$2"
+  local tmp
+
+  [[ -f "$SETTINGS_FILE" ]] || chat_settings_ensure
+  tmp="$SETTINGS_FILE.$$"
+  jq \
+    --arg key "$key" \
+    --arg value "$value" \
+    '
+      if $key == "workdir" then .workdir = $value
+      elif $key == "sync_render" then
+        if $value == "stream" or $value == "screen" then .sync_render = $value else . end
+      elif $key == "debug" then .debug = ($value == "true")
+      elif $key == "enable_message_update" then .enable_message_update = ($value == "true")
+      elif $key == "output_limit_chars" then .output_limit_chars = (try ($value|tonumber) catch .output_limit_chars)
+      else . end
+    ' "$SETTINGS_FILE" >"$tmp"
+  mv "$tmp" "$SETTINGS_FILE"
+  chat_settings_load_into_vars
+}
+
+chat_context_load() {
+  local raw_chat_id="$1"
+  local safe_chat_id
+
+  safe_chat_id="$(safe_fs_id "$raw_chat_id")"
+  CHAT_ID="$raw_chat_id"
+  CHAT_STATE_DIR="$CHATS_DIR/$safe_chat_id"
+  SETTINGS_FILE="$CHAT_STATE_DIR/settings.json"
+  STATUS_FILE="$CHAT_STATE_DIR/status.json"
+  TASK_LOG_FILE="$CHAT_STATE_DIR/current.log"
+  SESSION_ALIAS_FILE="$CHAT_STATE_DIR/session_aliases.tsv"
+  PINNED_SESSIONS_FILE="$CHAT_STATE_DIR/pinned_sessions.txt"
+  ACTIVE_SESSION_FILE="$CHAT_STATE_DIR/active_session.json"
+  SYNC_FILE="$CHAT_STATE_DIR/sync.json"
+  SYNC_STOP_FILE="$CHAT_STATE_DIR/sync.stop"
+  SYNC_LOCK_DIR="$CHAT_STATE_DIR/sync.lock"
+
+  mkdir -p "$CHAT_STATE_DIR"
+  chat_settings_ensure
+  chat_settings_load_into_vars
+}
+
+trim_ws() {
+  perl -CS -Mutf8 -0pe 's/^\s+|\s+$//g'
+}
+
+strip_group_mentions() {
+  # Best-effort: remove common mention tags or placeholders from group chats.
+  # Keep the remaining text as terminal input.
+  sed -E \
+    -e 's/<at[^>]*><\/at>//g' \
+    -e 's/<at[^>]*>[^<]*<\/at>//g' \
+    -e 's/@_user_[A-Za-z0-9]+//g'
+}
+
+extract_text_from_content() {
+  local content="$1"
+  local text=""
+
+  if [[ -z "$content" ]]; then
+    return 1
+  fi
+
+  if [[ "$content" == "{"*"}" ]]; then
+    text="$(jq -r '.text // empty' <<<"$content" 2>/dev/null || true)"
+    if [[ -n "$text" ]]; then
+      printf '%s' "$text"
+      return 0
+    fi
+  fi
+
+  printf '%s' "$content"
+}
+
+normalize_prompt() {
+  local prompt="$1"
+
+  prompt="$(printf '%s' "$prompt" | strip_group_mentions | trim_ws)"
+
+  if [[ "$prompt" == "$COMMAND_PREFIX" ]]; then
+    prompt=""
+  elif [[ "$prompt" == "$COMMAND_PREFIX "* ]]; then
+    prompt="${prompt#"$COMMAND_PREFIX "}"
+  elif [[ "$prompt" == "$COMMAND_PREFIX"$'\u3000'* ]]; then
+    prompt="${prompt#"$COMMAND_PREFIX"$'\u3000'}"
+  fi
+
+  prompt="$(printf '%s' "$prompt" | trim_ws)"
+  printf '%s' "$prompt"
 }
 
 reply_text() {
@@ -151,6 +340,39 @@ reply_card() {
     --as bot >/dev/null </dev/null
 }
 
+reply_card_capture_message_id() {
+  local message_id="$1"
+  local card_json="$2"
+  local response new_id
+
+  refresh_tenant_token
+  response="$(
+    lark-cli im +messages-reply \
+      --message-id "$message_id" \
+      --msg-type interactive \
+      --content "$card_json" \
+      --as bot </dev/null
+  )"
+
+  new_id="$(jq -r '.data.message_id // .data.message.message_id // empty' <<<"$response" 2>/dev/null || true)"
+  [[ -n "$new_id" ]] || return 1
+  printf '%s' "$new_id"
+}
+
+update_interactive_message() {
+  local target_message_id="$1"
+  local card_json="$2"
+
+  refresh_tenant_token
+  # Prefer PATCH; fall back to PUT for older tenants/endpoints.
+  lark-cli api patch "/im/v1/messages/$target_message_id" \
+    --data "$(jq -n --arg msg_type "interactive" --arg content "$card_json" '{msg_type:$msg_type, content:$content}')" \
+    --as bot >/dev/null </dev/null ||
+    lark-cli api put "/im/v1/messages/$target_message_id" \
+      --data "$(jq -n --arg msg_type "interactive" --arg content "$card_json" '{msg_type:$msg_type, content:$content}')" \
+      --as bot >/dev/null </dev/null
+}
+
 add_reaction() {
   local message_id="$1"
   local emoji_type="${2:-$ACK_REACTION_EMOJI}"
@@ -174,7 +396,7 @@ ack_message() {
       reply_text "$message_id" "$ACK_EMOJI"
       ;;
     reaction|*)
-      add_reaction "$message_id" "$ACK_REACTION_EMOJI" || reply_text "$message_id" "$ACK_EMOJI"
+      add_reaction "$message_id" "$ACK_REACTION_EMOJI" || true
       ;;
   esac
 }
@@ -191,7 +413,7 @@ failed_reply_text() {
   printf '❌ 失败\n\n%s\n\n发送 logs 查看最近日志。' "$detail"
 }
 
-card_json() {
+card_json_v1() {
   local title="$1"
   local template="$2"
   local body="$3"
@@ -217,6 +439,79 @@ card_json() {
     }'
 }
 
+card_json_v2() {
+  local title="$1"
+  local template="$2"
+  local body="$3"
+  local detail="${4:-}"
+
+  body="$(truncate_reply_text "$body")"
+  detail="$(truncate_reply_text "$detail")"
+
+  jq -n \
+    --arg title "$title" \
+    --arg template "$template" \
+    --arg body "$body" \
+    --arg detail "$detail" \
+    '{
+      schema: "2.0",
+      config: {
+        wide_screen_mode: true,
+        enable_forward: false,
+        update_multi: true
+      },
+      header: {
+        template: $template,
+        title: {tag: "plain_text", content: $title}
+      },
+      body: {
+        elements:
+          (
+            [
+              {tag: "markdown", content: $body}
+            ]
+            +
+            (if ($detail | length) > 0 then
+              [
+                {
+                  tag: "collapsible_panel",
+                  expanded: false,
+                  header: {
+                    title: {tag: "plain_text", content: "详情"},
+                    vertical_align: "center",
+                    icon: {
+                      tag: "standard_icon",
+                      token: "down-small-ccm_outlined",
+                      color: "",
+                      size: "16px 16px"
+                    },
+                    icon_position: "right",
+                    icon_expanded_angle: -180
+                  },
+                  elements: [
+                    {tag: "markdown", content: $detail}
+                  ]
+                }
+              ]
+            else [] end)
+          )
+      }
+    }'
+}
+
+card_json() {
+  local title="$1"
+  local template="$2"
+  local body="$3"
+  local detail="${4:-发送 status / logs 查看桥接状态}"
+
+  if [[ "$CARD_SCHEMA" == "2" || "$CARD_SCHEMA" == "2.0" ]]; then
+    card_json_v2 "$title" "$template" "$body" "$detail"
+  else
+    card_json_v1 "$title" "$template" "$body" "$detail"
+  fi
+}
+
 result_card_json() {
   local status="$1"
   local answer="$2"
@@ -224,7 +519,7 @@ result_card_json() {
   local prompt="$4"
   local session_id="${5:-}"
   local elapsed_seconds="${6:-0}"
-  local title template target body number
+  local title template target body number detail workdir
 
   if [[ "$status" == "success" ]]; then
     title="✅ 完成"
@@ -246,22 +541,24 @@ result_card_json() {
   fi
 
   prompt="$(printf '%s' "$prompt" | compact_text 180)"
-  if [[ "$OUTPUT_STYLE" == "verbose" ]]; then
-    body=$(
-      printf '**目标**：%s\n' "$target"
-      printf '**任务**：%s\n' "$prompt"
-      printf '**耗时**：%ss\n' "$elapsed_seconds"
-      printf '**队列**：%s\n\n' "$(queue_count)"
-      printf '%s' "$(truncate_reply_text "$answer" "$MAX_REPLY_CHARS")"
-    )
-  else
-    body=$(
-      [[ -n "$session_id" ]] && printf '**会话**：%s\n\n' "$target" || true
-      printf '%s' "$(truncate_reply_text "$answer" "$MAX_REPLY_CHARS")"
-    )
-  fi
+  body="$(printf '%s' "$answer")"
 
-  card_json "$title" "$template" "$body" "task: $task_id · logs"
+  detail=$(
+    printf '**任务**：%s\n' "$prompt"
+    printf '**目标**：%s\n' "$target"
+    if [[ -z "$session_id" ]]; then
+      workdir="${CHAT_WORKDIR:-$CODEX_WORKDIR}"
+      [[ -n "$workdir" ]] && printf '**workdir**：%s\n' "$workdir"
+    fi
+    printf '**耗时**：%ss\n' "$elapsed_seconds"
+    printf '**队列**：%s\n' "$(queue_count)"
+    printf '**task_id**：%s\n' "$task_id"
+    if [[ "$CHAT_DEBUG" == "true" || "$OUTPUT_STYLE" == "verbose" ]]; then
+      printf '\n命令：logs / status / 目录 / 当前会话\n'
+    fi
+  )
+
+  card_json "$title" "$template" "$body" "$detail"
 }
 
 reply_result() {
@@ -286,6 +583,19 @@ reply_result() {
   else
     reply_text "$message_id" "$fallback"
   fi
+}
+
+reply_notice() {
+  local message_id="$1"
+  local title="$2"
+  local template="$3"
+  local body="$4"
+  local detail="${5:-}"
+  local fallback="${6:-$body}"
+  local card
+
+  card="$(card_json "$title" "$template" "$body" "$detail")"
+  reply_card "$message_id" "$card" || reply_text "$message_id" "$fallback"
 }
 
 set_status() {
@@ -315,7 +625,7 @@ next_queue_file() {
 }
 
 pop_queue_task() {
-  local queue_file queued_json queued_task_id queued_message_id queued_prompt queued_session_id queued_reply_mode queued_title
+  local queue_file queued_json queued_task_id queued_message_id queued_prompt queued_session_id queued_reply_mode queued_chat_id queued_title
 
   queue_file="$(next_queue_file)"
   [[ -n "$queue_file" && -f "$queue_file" ]] || return 1
@@ -328,11 +638,14 @@ pop_queue_task() {
   queued_prompt="$(jq -r '.prompt // empty' <<<"$queued_json")"
   queued_session_id="$(jq -r '.session_id // empty' <<<"$queued_json")"
   queued_reply_mode="$(jq -r '.reply_mode // "final"' <<<"$queued_json")"
+  queued_chat_id="$(jq -r '.chat_id // empty' <<<"$queued_json")"
 
   if [[ -z "$queued_task_id" || -z "$queued_message_id" || -z "$queued_prompt" ]]; then
     return 1
   fi
 
+  [[ -n "$queued_chat_id" ]] || queued_chat_id="unknown"
+  chat_context_load "$queued_chat_id"
   run_codex_task "$queued_task_id" "$queued_message_id" "$queued_prompt" "$queued_session_id" "$queued_reply_mode"
 }
 
@@ -381,7 +694,8 @@ enqueue_task() {
   local prompt="$2"
   local session_id="${3:-}"
   local reply_mode="${4:-final}"
-  local task_id filename tmp count title
+  local chat_id="${5:-${CHAT_ID:-unknown}}"
+  local task_id filename tmp
 
   task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
   filename="$TASK_QUEUE_DIR/$(perl -MTime::HiRes=time -e 'printf "%.6f", time' | tr -d .)-$$-$RANDOM.json"
@@ -389,42 +703,53 @@ enqueue_task() {
   jq -n \
     --arg task_id "$task_id" \
     --arg message_id "$message_id" \
+    --arg chat_id "$chat_id" \
     --arg prompt "$prompt" \
     --arg session_id "$session_id" \
     --arg reply_mode "$reply_mode" \
     --arg queued_at "$(timestamp)" \
-    '{task_id:$task_id,message_id:$message_id,prompt:$prompt,session_id:$session_id,reply_mode:$reply_mode,queued_at:$queued_at}' \
+    '{task_id:$task_id,message_id:$message_id,chat_id:$chat_id,prompt:$prompt,session_id:$session_id,reply_mode:$reply_mode,queued_at:$queued_at}' \
     >"$tmp"
   mv "$tmp" "$filename"
 
-  count="$(queue_count)"
-  ack_message "$message_id"
+  : # queued
 }
 
 queue_text() {
-  local count file index prompt session_id title queued_at
+  local count file index prompt session_id title queued_at chat_id chat_filter matched
+  local total
 
-  count="$(queue_count)"
-  if [[ "$count" == "0" ]]; then
-    printf '$ codex queue\nempty'
+  total="$(queue_count)"
+  if [[ "$total" == "0" ]]; then
+    printf '队列为空。'
     return
   fi
 
-  printf '$ codex queue\n'
+  chat_filter="${CHAT_ID:-}"
+  matched=0
   index=1
   while IFS= read -r file; do
     [[ -f "$file" ]] || continue
+    chat_id="$(jq -r '.chat_id // empty' "$file" 2>/dev/null || true)"
+    if [[ -n "$chat_filter" && -n "$chat_id" && "$chat_id" != "$chat_filter" ]]; then
+      continue
+    fi
     prompt="$(jq -r '.prompt // ""' "$file" | compact_text 80)"
     session_id="$(jq -r '.session_id // empty' "$file")"
     queued_at="$(jq -r '.queued_at // ""' "$file")"
     if [[ -n "$session_id" ]]; then
       title="$(session_title "$session_id")"
-      printf '[%s] %s -> %s\n    %s\n' "$index" "$queued_at" "$title" "$prompt"
+      printf '[%s] %s -> %s\n%s\n\n' "$index" "$queued_at" "$title" "$prompt"
     else
-      printf '[%s] %s -> new task\n    %s\n' "$index" "$queued_at" "$prompt"
+      printf '[%s] %s -> 新任务\n%s\n\n' "$index" "$queued_at" "$prompt"
     fi
+    matched=1
     index=$((index + 1))
   done < <(find "$TASK_QUEUE_DIR" -type f -name '*.json' 2>/dev/null | sort)
+
+  if [[ "$matched" == "0" ]]; then
+    printf '当前窗口队列为空。\n全局队列: %s' "$total"
+  fi
 }
 
 status_text() {
@@ -444,10 +769,37 @@ status_text() {
 }
 
 status_card_json() {
-  local status
+  local queued state task_id updated prompt detail body extra
 
-  status="$(status_text)"
-  card_json "Codex Bridge 状态" "blue" "$status" "发送 目录 查看会话，logs 查看日志"
+  queued="$(queue_count)"
+  if [[ ! -f "$STATUS_FILE" ]]; then
+    body="还没有任务记录。直接发送要我处理的内容即可开始。"
+    extra="队列：$queued\n命令：目录 / logs / status"
+    card_json "状态" "blue" "$body" "$extra"
+    return
+  fi
+
+  state="$(jq -r '.state // ""' "$STATUS_FILE" 2>/dev/null || true)"
+  task_id="$(jq -r '.task_id // ""' "$STATUS_FILE" 2>/dev/null || true)"
+  updated="$(jq -r '.updated_at // ""' "$STATUS_FILE" 2>/dev/null || true)"
+  prompt="$(jq -r '.prompt // ""' "$STATUS_FILE" 2>/dev/null || true)"
+  detail="$(jq -r '.detail // ""' "$STATUS_FILE" 2>/dev/null || true)"
+  prompt="$(printf '%s' "$prompt" | compact_text 220)"
+  detail="$(printf '%s' "$detail" | compact_text 220)"
+
+  body=$(
+    printf '**状态**：%s\n' "${state:-unknown}"
+    [[ -n "$prompt" ]] && printf '\n%s\n' "$prompt" || true
+    [[ -n "$detail" ]] && printf '\n_%s_\n' "$detail" || true
+  )
+  extra=$(
+    printf '**task_id**：%s\n' "${task_id:-}"
+    printf '**更新时间**：%s\n' "${updated:-}"
+    printf '**队列**：%s\n' "$queued"
+    printf '命令：目录 / logs / 队列\n'
+  )
+
+  card_json "状态" "blue" "$body" "$extra"
 }
 
 reply_status() {
@@ -612,7 +964,6 @@ session_stream_text() {
   local session_id="$1"
   local from_line="${2:-1}"
   local limit="${3:-24}"
-  local include_header="${4:-true}"
   local file row id updated title cwd rollout_path archived number prefix body
 
   session_id="$(resolve_session_ref "$session_id" || true)"
@@ -666,19 +1017,7 @@ session_stream_text() {
       tail -n "$limit"
   )"
 
-  if [[ "$include_header" == "true" ]]; then
-    printf '$ codex tail -f %s%s\n' "$prefix" "${title:-未命名}"
-    [[ -n "$cwd" ]] && printf 'cwd: %s\n' "$cwd"
-    printf 'session: %s\n' "$session_id"
-    printf -- '---\n'
-  fi
-  if [[ -n "$body" ]]; then
-    printf '%s' "$body"
-  else
-    if [[ "$include_header" == "true" ]]; then
-      printf '[%s] wait> 暂无新事件' "$(timestamp)"
-    fi
-  fi
+  [[ -n "$body" ]] && printf '%s' "$body" || true
 }
 
 session_summary_text() {
@@ -813,11 +1152,11 @@ switch_session_ref() {
   if [[ -d "$SYNC_LOCK_DIR" ]]; then
     [[ -n "$seconds" ]] || seconds=600
     update_sync_session "$session_id" "$seconds" || true
-    reply "$message_id" "✅ 已常驻: $title"$'\n'"同步流已切换。"
+    reply_notice "$message_id" "✅ 已常驻" "green" "$title" "同步流已切换。发送 停止同步 可结束同步。" "✅ 已常驻: $title"$'\n'"同步流已切换。"
   elif [[ -n "$seconds" ]]; then
     start_sync "$message_id" "$seconds" "$session_id"
   else
-    reply "$message_id" "✅ 已常驻: $title"
+    reply_notice "$message_id" "✅ 已常驻" "green" "$title" "普通消息会进入这个会话；发送 清除会话 可取消。" "✅ 已常驻: $title"
   fi
 }
 
@@ -834,11 +1173,114 @@ current_session_text() {
   printf '当前会话\n标题: %s\nID: %s\n\n普通消息会发送到这个会话。发送 清除会话 可取消。' "$title" "$session_id"
 }
 
+reply_current_session() {
+  local message_id="$1"
+  local session_id title number label body detail
+
+  session_id="$(active_session_id || true)"
+  if [[ -z "$session_id" ]]; then
+    body="未绑定会话。发送 目录 查看编号，然后发送 切换 1。"
+    detail="命令：目录 / 切换 N / 新任务 <内容>"
+    reply_notice "$message_id" "当前会话" "blue" "$body" "$detail" "$body"
+    return
+  fi
+
+  title="$(session_title "$session_id")"
+  number="$(session_alias_number "$session_id" || true)"
+  [[ -n "$number" ]] && label="#$number $title" || label="${title:-未命名}"
+  body="$label"
+  detail=$(
+    printf '**ID**：%s\n' "$session_id"
+    printf '命令：清除会话 / 会话 %s / 同步会话 %s 10分钟\n' "${number:-$session_id}" "${number:-$session_id}"
+  )
+  reply_notice "$message_id" "当前会话" "blue" "$body" "$detail" "$label"
+}
+
 detach_active_session() {
   local message_id="$1"
 
   rm -f "$ACTIVE_SESSION_FILE"
-  reply "$message_id" "✅ 已清除当前会话。后续普通消息会创建新任务。"
+  reply_notice "$message_id" "✅ 已清除会话" "green" "后续普通消息会创建新任务。" "命令：目录 / 切换 N / 新任务 <内容>" "✅ 已清除当前会话。后续普通消息会创建新任务。"
+}
+
+reply_pwd() {
+  local message_id="$1"
+  local workdir="${CHAT_WORKDIR:-$CODEX_WORKDIR}"
+  reply_notice "$message_id" "工作目录" "blue" "$workdir" "命令：cd /path 或 cwd /path" "$workdir"
+}
+
+cmd_cd() {
+  local message_id="$1"
+  local arg_path="$2"
+  local base expanded target abs
+
+  expanded="$(expand_path "$arg_path")"
+  base="${CHAT_WORKDIR:-$CODEX_WORKDIR}"
+  if [[ -n "$expanded" && "$expanded" != /* ]]; then
+    target="$base/$expanded"
+  else
+    target="$expanded"
+  fi
+
+  if abs="$(cd "$target" 2>/dev/null && pwd)"; then
+    chat_settings_set "workdir" "$abs"
+    reply_notice "$message_id" "✅ 已设置工作目录" "green" "$abs" "命令：pwd" "✅ 已设置工作目录: $abs"
+  else
+    reply_notice "$message_id" "❌ 目录不可用" "red" "$target" "请发送一个存在的本地目录路径（例如：cd ~/Documents）" "❌ 目录不可用: $target"
+  fi
+}
+
+cmd_debug() {
+  local message_id="$1"
+  local mode="$2"
+
+  case "$mode" in
+    on|true|1|enable|enabled)
+      chat_settings_set "debug" "true"
+      reply_notice "$message_id" "Debug" "blue" "已开启 debug。" "之后卡片折叠区会更详细。" "debug on"
+      ;;
+    off|false|0|disable|disabled)
+      chat_settings_set "debug" "false"
+      reply_notice "$message_id" "Debug" "blue" "已关闭 debug。" "" "debug off"
+      ;;
+    *)
+      reply_notice "$message_id" "Debug" "blue" "用法：debug on / debug off" "" "用法：debug on / debug off"
+      ;;
+  esac
+}
+
+cmd_syncmode() {
+  local message_id="$1"
+  local mode="$2"
+
+  case "$mode" in
+    stream|screen)
+      chat_settings_set "sync_render" "$mode"
+      reply_notice "$message_id" "同步渲染" "blue" "已设置为：$mode" "screen 模式需要 im:message:update 权限；失败会自动降级为 stream。" "已设置同步渲染: $mode"
+      ;;
+    *)
+      reply_notice "$message_id" "同步渲染" "blue" "用法：syncmode stream / syncmode screen" "" "用法：syncmode stream / syncmode screen"
+      ;;
+  esac
+}
+
+cmd_update_mode() {
+  local message_id="$1"
+  local mode="$2"
+
+  case "$mode" in
+    on|true|1|enable|enabled)
+      chat_settings_set "enable_message_update" "true"
+      reply_notice "$message_id" "消息更新" "blue" "已开启 message update。" "需要 im:message:update 权限；失败会自动降级为逐条 stream。" "update on"
+      ;;
+    off|false|0|disable|disabled)
+      chat_settings_set "enable_message_update" "false"
+      reply_notice "$message_id" "消息更新" "blue" "已关闭 message update。" "" "update off"
+      ;;
+    *)
+      reply_notice "$message_id" "消息更新" "blue" "用法：update on / update off" "" "用法：update on / update off"
+      ;;
+  esac
 }
 
 build_session_directory_text() {
@@ -939,7 +1381,7 @@ pin_session_ref() {
 
   session_id="$(resolve_session_ref "$ref" || true)"
   if [[ -z "$session_id" ]]; then
-    reply "$message_id" "没有找到这个会话编号。先发送 目录 获取编号。"
+    reply_notice "$message_id" "❌ 未找到会话" "red" "没有找到这个会话编号。" "先发送 目录 获取编号。" "没有找到这个会话编号。先发送 目录 获取编号。"
     return
   fi
 
@@ -947,7 +1389,7 @@ pin_session_ref() {
   tmp="$PINNED_SESSIONS_FILE.$$"
   { [[ -f "$PINNED_SESSIONS_FILE" ]] && grep -v -F -x "$session_id" "$PINNED_SESSIONS_FILE" || true; printf '%s\n' "$session_id"; } >"$tmp"
   mv "$tmp" "$PINNED_SESSIONS_FILE"
-  reply "$message_id" "已置顶: $title"$'\n'"$session_id"
+  reply_notice "$message_id" "已置顶" "green" "$title" "**ID**：$session_id" "已置顶: $title"$'\n'"$session_id"
 }
 
 unpin_session_ref() {
@@ -957,7 +1399,7 @@ unpin_session_ref() {
 
   session_id="$(resolve_session_ref "$ref" || true)"
   if [[ -z "$session_id" ]]; then
-    reply "$message_id" "没有找到这个会话编号。先发送 目录 获取编号。"
+    reply_notice "$message_id" "❌ 未找到会话" "red" "没有找到这个会话编号。" "先发送 目录 获取编号。" "没有找到这个会话编号。先发送 目录 获取编号。"
     return
   fi
 
@@ -965,7 +1407,7 @@ unpin_session_ref() {
   tmp="$PINNED_SESSIONS_FILE.$$"
   [[ -f "$PINNED_SESSIONS_FILE" ]] && grep -v -F -x "$session_id" "$PINNED_SESSIONS_FILE" >"$tmp" || : >"$tmp"
   mv "$tmp" "$PINNED_SESSIONS_FILE"
-  reply "$message_id" "已取消置顶: $title"
+  reply_notice "$message_id" "已取消置顶" "blue" "$title" "" "已取消置顶: $title"
 }
 
 parse_sync_seconds() {
@@ -1028,6 +1470,81 @@ sync_snapshot_text() {
     "$(recent_logs_text)"
 }
 
+sync_delta_card_json() {
+  local session_id="$1"
+  local delta="$2"
+  local title template detail label number
+  local body
+
+  title="同步"
+  template="blue"
+  label="$(session_title "$session_id")"
+  number="$(session_alias_number "$session_id" || true)"
+  [[ -n "$number" ]] && label="#$number $label"
+
+  body=$(
+    printf '```text\n%s\n```' "$delta"
+  )
+
+  detail=$(
+    printf '**会话**：%s\n' "$label"
+    printf '**ID**：%s\n' "$session_id"
+    printf '命令：停止同步 / 切换 N / 清除会话\n'
+  )
+
+  card_json "$title" "$template" "$body" "$detail"
+}
+
+reply_sync_delta() {
+  local message_id="$1"
+  local session_id="$2"
+  local delta="$3"
+  local card
+
+  [[ -n "$delta" ]] || return 0
+
+  if [[ "${SYNC_SCREEN_MODE:-false}" == "true" && -n "${SYNC_SCREEN_MESSAGE_ID:-}" && -n "${SYNC_SCREEN_BUFFER_FILE:-}" ]]; then
+    # Append to rolling screen buffer, then update the same message card.
+    {
+      printf '%s\n' "$delta"
+    } >>"$SYNC_SCREEN_BUFFER_FILE" || true
+    tail -n "${SYNC_SCREEN_MAX_LINES:-180}" "$SYNC_SCREEN_BUFFER_FILE" >"$SYNC_SCREEN_BUFFER_FILE.$$" 2>/dev/null || true
+    mv "$SYNC_SCREEN_BUFFER_FILE.$$" "$SYNC_SCREEN_BUFFER_FILE" 2>/dev/null || true
+
+    card="$(sync_delta_card_json "$session_id" "$(cat "$SYNC_SCREEN_BUFFER_FILE" 2>/dev/null || printf '%s' "$delta")")"
+    if update_interactive_message "$SYNC_SCREEN_MESSAGE_ID" "$card"; then
+      return 0
+    fi
+
+    # If updates fail (missing scope, rate limit, etc), degrade to stream.
+    SYNC_SCREEN_MODE="false"
+  fi
+
+  card="$(sync_delta_card_json "$session_id" "$delta")"
+  reply_card "$message_id" "$card" || reply_text "$message_id" "$delta"
+}
+
+sync_screen_init() {
+  local message_id="$1"
+  local session_id="$2"
+  local card new_id
+
+  SYNC_SCREEN_MODE="false"
+  SYNC_SCREEN_MESSAGE_ID=""
+  SYNC_SCREEN_BUFFER_FILE="${CHAT_STATE_DIR:-$STATE_DIR}/sync.screen.txt"
+  : >"$SYNC_SCREEN_BUFFER_FILE" || true
+
+  card="$(sync_delta_card_json "$session_id" "")"
+  if new_id="$(reply_card_capture_message_id "$message_id" "$card" 2>/dev/null)"; then
+    SYNC_SCREEN_MESSAGE_ID="$new_id"
+    SYNC_SCREEN_MODE="true"
+    return 0
+  fi
+
+  SYNC_SCREEN_MODE="false"
+  return 1
+}
+
 sync_loop() {
   local message_id="$1"
   local seconds="$2"
@@ -1049,23 +1566,27 @@ sync_loop() {
 
   last_lines=0
 
-	  if [[ -n "$session_id" ]]; then
-	    set_active_session "$session_id"
-	    session_file="$(find_session_file "$session_id")"
-	    if [[ -n "$session_file" && -f "$session_file" ]]; then
-	      current_lines="$(wc -l <"$session_file" | tr -d ' ')"
-	      first_line=$((current_lines - 500))
-	      if ((first_line < 1)); then
-	        first_line=1
-	      fi
-	      delta="$(session_stream_text "$session_id" "$first_line" 24 false)"
-	      [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
-	      last_lines="$current_lines"
-	    else
-	      delta="$(session_stream_text "$session_id" 1 24 false)"
-	      [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
-	    fi
-	  fi
+  if [[ "${CHAT_SYNC_RENDER:-stream}" == "screen" && "${CHAT_ENABLE_MESSAGE_UPDATE:-false}" == "true" ]]; then
+    sync_screen_init "$message_id" "$session_id" || true
+  fi
+
+		  if [[ -n "$session_id" ]]; then
+		    set_active_session "$session_id"
+		    session_file="$(find_session_file "$session_id")"
+		    if [[ -n "$session_file" && -f "$session_file" ]]; then
+		      current_lines="$(wc -l <"$session_file" | tr -d ' ')"
+		      first_line=$((current_lines - 500))
+		      if ((first_line < 1)); then
+		        first_line=1
+		      fi
+		      delta="$(session_stream_text "$session_id" "$first_line" 24 false)"
+		      reply_sync_delta "$message_id" "$session_id" "$delta" || true
+		      last_lines="$current_lines"
+		    else
+		      delta="$(session_stream_text "$session_id" 1 24 false)"
+		      reply_sync_delta "$message_id" "$session_id" "$delta" || true
+		    fi
+		  fi
 
   while :; do
     if [[ -f "$SYNC_FILE" ]]; then
@@ -1075,7 +1596,7 @@ sync_loop() {
     (( $(date '+%s') < end_at )) || break
 
     if [[ -f "$SYNC_STOP_FILE" ]]; then
-      reply "$message_id" "已停止进度同步。"
+      reply_notice "$message_id" "已停止同步" "blue" "同步已停止。" "命令：同步会话 N 10分钟 / 停止同步" "已停止进度同步。"
       break
     fi
 
@@ -1097,14 +1618,19 @@ sync_loop() {
 	      last_lines="$current_lines"
 	      label="$(session_title "$session_id")"
 	      number="$(session_alias_number "$session_id" || true)"
-	      [[ -n "$number" ]] && label="#$number $label"
-	      delta="$(session_stream_text "$session_id" "$first_line" 18 false)"
-	      if [[ -n "$delta" ]]; then
-	        reply "$message_id" "同步切换到: $label"$'\n\n'"$delta" || true
-	      else
-	        reply "$message_id" "同步切换到: $label" || true
-	      fi
-	    fi
+		      [[ -n "$number" ]] && label="#$number $label"
+			      delta="$(session_stream_text "$session_id" "$first_line" 18 false)"
+			      if [[ "${SYNC_SCREEN_MODE:-false}" == "true" ]]; then
+			        reply_sync_delta "$message_id" "$session_id" "sync> switched to: $label" || true
+			        reply_sync_delta "$message_id" "$session_id" "$delta" || true
+			      else
+			        if [[ -n "$delta" ]]; then
+			          reply_notice "$message_id" "同步已切换" "blue" "$(printf '```text\n%s\n```' "$delta")" "已切换到：$label\n命令：停止同步" "同步切换到: $label"$'\n\n'"$delta" || true
+			        else
+			          reply_notice "$message_id" "同步已切换" "blue" "$label" "命令：停止同步" "同步切换到: $label" || true
+			        fi
+			      fi
+			    fi
 
       session_file="$(find_session_file "$session_id")"
       current_lines=0
@@ -1112,18 +1638,19 @@ sync_loop() {
       if ((last_lines > 0 && current_lines == last_lines)); then
         : # no-op; keep silent when no new events
       else
-	        if ((last_lines > 0)); then
-	          delta="$(session_stream_text "$session_id" $((last_lines + 1)) 30 false)"
-	          [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
-	        else
-	          delta="$(session_stream_text "$session_id" 1 30 false)"
-	          [[ -n "$delta" ]] && reply "$message_id" "$delta" || true
-	        fi
-	      fi
-      last_lines="$current_lines"
-    else
-      reply "$message_id" "$(sync_snapshot_text)" || true
-    fi
+		        if ((last_lines > 0)); then
+		          delta="$(session_stream_text "$session_id" $((last_lines + 1)) 30 false)"
+		          reply_sync_delta "$message_id" "$session_id" "$delta" || true
+		        else
+		          delta="$(session_stream_text "$session_id" 1 30 false)"
+		          reply_sync_delta "$message_id" "$session_id" "$delta" || true
+		        fi
+		      fi
+	      last_lines="$current_lines"
+	    else
+	      # Disabled: avoid watchdog-style periodic pushes when no session is bound.
+	      true
+	    fi
 
     state=""
     if [[ -z "$session_id" && -f "$STATUS_FILE" ]]; then
@@ -1156,21 +1683,31 @@ start_sync() {
   local seconds="$2"
   local session_id="${3:-}"
 
+  if [[ -z "$session_id" ]]; then
+    session_id="$(active_session_id || true)"
+  fi
+  if [[ -z "$session_id" ]]; then
+    reply_notice "$message_id" "❌ 无可同步会话" "red" "当前没有绑定会话。" "先发送 目录 获取编号，然后发送：切换 1 或 同步会话 1 10分钟" "当前没有绑定会话。先发送 目录 获取编号，然后发送：切换 1 或 同步会话 1 10分钟"
+    return
+  fi
+
   if ! mkdir "$SYNC_LOCK_DIR" 2>/dev/null; then
     if [[ -n "$session_id" ]]; then
       switch_session_ref "$message_id" "$session_id" "$seconds"
       return
     fi
-    reply "$message_id" "已有进度同步正在运行。发送 停止同步 结束当前同步。"
+    reply_notice "$message_id" "已有同步在运行" "blue" "发送 停止同步 结束当前同步。" "" "已有进度同步正在运行。发送 停止同步 结束当前同步。"
     return
   fi
 
   rm -f "$SYNC_STOP_FILE"
   if [[ -n "$session_id" ]]; then
     set_active_session "$session_id"
-    reply "$message_id" "已开始同步（${seconds}s）。会话已常驻；发送 停止同步 可结束同步。"
-  else
-    reply "$message_id" "已开始进度同步（${seconds}s）。发送 停止同步 可结束。"
+    if [[ "${CHAT_SYNC_RENDER:-stream}" == "screen" && "${CHAT_ENABLE_MESSAGE_UPDATE:-false}" == "true" ]]; then
+      : # screen mode will post/update a single card; avoid extra chatter
+    else
+      reply_notice "$message_id" "已开始同步" "blue" "$(session_title "$session_id")" "时长：${seconds}s\n命令：停止同步" "已开始同步（${seconds}s）。会话已常驻；发送 停止同步 可结束同步。"
+    fi
   fi
   sync_loop "$message_id" "$seconds" "$session_id" &
 }
@@ -1179,12 +1716,12 @@ stop_sync() {
   local message_id="$1"
 
   if [[ ! -d "$SYNC_LOCK_DIR" ]]; then
-    reply "$message_id" "当前没有正在运行的进度同步。"
+    reply_notice "$message_id" "没有同步在运行" "blue" "当前没有正在运行的同步。" "" "当前没有正在运行的进度同步。"
     return
   fi
 
   : >"$SYNC_STOP_FILE"
-  reply "$message_id" "收到，正在停止同步（会话常驻不变）。"
+  reply_notice "$message_id" "收到" "blue" "正在停止同步（会话常驻不变）。" "" "收到，正在停止同步（会话常驻不变）。"
 }
 
 run_codex_task() {
@@ -1209,7 +1746,7 @@ run_codex_task() {
   {
     echo "$(timestamp) task_id=$task_id started"
     echo "model=$CODEX_MODEL"
-    echo "workdir=$CODEX_WORKDIR"
+    echo "workdir=${CHAT_WORKDIR:-$CODEX_WORKDIR}"
     [[ -n "$session_id" ]] && echo "resume_session=$session_id"
     echo
   } >>"$TASK_LOG_FILE"
@@ -1238,7 +1775,7 @@ run_codex_task() {
     (
       printf '%s' "$prompt" |
         "$CODEX_BIN" exec \
-          -C "$CODEX_WORKDIR" \
+          -C "${CHAT_WORKDIR:-$CODEX_WORKDIR}" \
           -m "$CODEX_MODEL" \
           --skip-git-repo-check \
           --full-auto \
@@ -1282,27 +1819,26 @@ lark-cli event +subscribe \
   --compact \
   --quiet |
 while IFS= read -r line; do
-  content="$(jq -r '.content // empty' <<<"$line")"
+  raw_content="$(jq -r '.content // empty' <<<"$line")"
   message_id="$(jq -r '.message_id // empty' <<<"$line")"
   sender_id="$(jq -r '.sender_id // empty' <<<"$line")"
+  chat_id="$(jq -r '.chat_id // .chat.id // empty' <<<"$line")"
 
-  [[ -n "$content" && -n "$message_id" ]] || continue
+  [[ -n "$raw_content" && -n "$message_id" ]] || continue
 
-  prompt="$content"
-  if [[ "$prompt" == "$COMMAND_PREFIX" ]]; then
-    prompt=""
-  elif [[ "$prompt" == "$COMMAND_PREFIX "* ]]; then
-    prompt="${prompt#"$COMMAND_PREFIX "}"
-  elif [[ "$prompt" == "$COMMAND_PREFIX"$'\u3000'* ]]; then
-    prompt="${prompt#"$COMMAND_PREFIX"$'\u3000'}"
-  fi
-
-  echo "$(timestamp) command message_id=$message_id sender_id=$sender_id content_length=${#content}" >&2
+  echo "$(timestamp) command message_id=$message_id sender_id=$sender_id chat_id=$chat_id content_length=${#raw_content}" >&2
 
   if [[ -n "$ALLOWED_SENDER" && "$sender_id" != "$ALLOWED_SENDER" ]]; then
     echo "$(timestamp) ignored sender_id=$sender_id; allowed_sender=$ALLOWED_SENDER" >&2
     continue
   fi
+
+  [[ -n "$chat_id" ]] || chat_id="unknown"
+  chat_context_load "$chat_id"
+
+  prompt="$(extract_text_from_content "$raw_content" 2>/dev/null || true)"
+  prompt="$(normalize_prompt "$prompt")"
+  ack_message "$message_id" || true
 
   if [[ -z "$prompt" ]]; then
     reply "$message_id" "收到。直接发送要我处理的内容即可。发送 目录 查看会话编号，help 查看命令。"
@@ -1315,15 +1851,15 @@ while IFS= read -r line; do
       continue
       ;;
     logs|日志)
-      reply "$message_id" "$(logs_text)"
+      reply_notice "$message_id" "Logs" "blue" "$(logs_text)" "命令：status / 目录 / 队列" "$(logs_text)"
       continue
       ;;
     queue|队列)
-      reply "$message_id" "$(queue_text)"
+      reply_notice "$message_id" "Queue" "blue" "$(queue_text)" "命令：status / logs" "$(queue_text)"
       continue
       ;;
     help|帮助)
-      reply "$message_id" "直接发送内容 = 发送到当前会话；没有当前会话时创建新任务"$'\n'"目录 = 查看会话编号"$'\n'"切换 1 = 设为当前会话"$'\n'"当前会话 = 查看当前目标"$'\n'"清除会话 = 取消当前目标"$'\n'"新任务 <内容> = 强制创建新任务"$'\n'"会话 1 = 查看会话进度"$'\n'"同步会话 1 10分钟 = 像终端 tail 一样同步输出"$'\n'"队列 = 查看等待执行的消息"$'\n'"置顶 1 / 取消置顶 1 = 管理目录置顶"$'\n'"停止同步 = 结束同步输出"$'\n'"status / logs = 查看桥接任务"
+      reply_notice "$message_id" "命令" "blue" "普通消息：发送到当前会话（未绑定会话时创建新任务）\n\n核心：目录 / 切换 N / 清除会话 / 会话 N / 同步会话 N 10分钟 / 停止同步\n\n终端：cd /path / pwd\n\n诊断：status / logs / 队列 / debug on|off" "" "发送 help 查看命令"
       continue
       ;;
     目录|会话目录|sessions|"session list")
@@ -1333,7 +1869,7 @@ while IFS= read -r line; do
   esac
 
   if [[ "$prompt" =~ ^(当前会话|current)$ ]]; then
-    reply "$message_id" "$(current_session_text)"
+    reply_current_session "$message_id"
     continue
   fi
 
@@ -1342,8 +1878,33 @@ while IFS= read -r line; do
     continue
   fi
 
+  if [[ "$prompt" =~ ^(pwd)$ ]]; then
+    reply_pwd "$message_id"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(cd|cwd)[[:space:]]+(.+)$ ]]; then
+    cmd_cd "$message_id" "${BASH_REMATCH[2]}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^debug([[:space:]]+(.+))?$ ]]; then
+    cmd_debug "$message_id" "${BASH_REMATCH[2]:-}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(syncmode|同步模式)[[:space:]]+([^[:space:]]+)$ ]]; then
+    cmd_syncmode "$message_id" "${BASH_REMATCH[2]}"
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(update|更新)([[:space:]]+(.+))?$ ]]; then
+    cmd_update_mode "$message_id" "${BASH_REMATCH[3]:-}"
+    continue
+  fi
+
   if [[ "$prompt" =~ ^(会话|session)[[:space:]]+([^[:space:]]+)$ ]]; then
-    reply "$message_id" "$(session_summary_text "${BASH_REMATCH[2]}")"
+    reply_notice "$message_id" "会话进度" "blue" "$(session_summary_text "${BASH_REMATCH[2]}")" "命令：切换 N / 同步会话 N 10分钟" "$(session_summary_text "${BASH_REMATCH[2]}")"
     continue
   fi
 
@@ -1424,7 +1985,6 @@ while IFS= read -r line; do
 
     task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
     set_status "queued" "$task_id" "$message_id" "$prompt" "已进入后台执行"
-    ack_message "$message_id"
     run_codex_task "$task_id" "$message_id" "$prompt" &
     continue
   fi
@@ -1438,7 +1998,6 @@ while IFS= read -r line; do
 
     task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
     set_status "queued" "$task_id" "$message_id" "$prompt" "已发送到会话 $attached_session_id"
-    ack_message "$message_id"
     run_codex_task "$task_id" "$message_id" "$prompt" "$attached_session_id" "stream" &
     continue
   fi
@@ -1450,6 +2009,5 @@ while IFS= read -r line; do
 
   task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
   set_status "queued" "$task_id" "$message_id" "$prompt" "已进入后台执行"
-  ack_message "$message_id"
   run_codex_task "$task_id" "$message_id" "$prompt" &
 done

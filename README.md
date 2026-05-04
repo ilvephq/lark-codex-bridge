@@ -8,11 +8,12 @@
 
 - 直接发消息给机器人，让 Codex 执行任务。
 - 忙时自动排队。
+- 每个飞书/Lark 聊天（DM/群）都是一个独立“终端窗口”：状态按 `chat_id` 隔离。
 - 查看 Codex 会话目录，并用编号选择会话。
-- `切换 1` 后常驻绑定本地 Codex 会话，普通消息会无缝进入当前会话。
-- 同步会话进度，像手机上的轻量终端流。
+- `切换 1` 后常驻绑定本地 Codex 会话，普通消息会无缝进入当前会话（直到 `清除会话`）。
+- 同步会话进度，像手机上的轻量终端流（默认只在有新事件时推送，完全静默等待）。
 - 在同步期间直接给当前会话继续发消息。
-- 结果和会话目录优先使用飞书/Lark 交互卡片展示。
+- 输出默认使用 Card JSON 2.0：主内容清爽可读，元信息放在折叠区（默认收起）。
 - 支持 `screen` 后台运行。
 
 ## 依赖
@@ -64,6 +65,7 @@ LARK_CODEX_ALLOWED_SENDER=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 - 基础体验：接收消息、以机器人身份回复消息。
 - 完整体验：再添加 `im:message.reactions:write_only`，用于收到消息后添加 `OK` 表情。
+- 可选增强：`im:message:update`，用于 `syncmode screen + update on` 时更新同一张卡片（失败会自动降级，不影响核心功能）。
 - 交互卡片通过消息回复发送；如果卡片发送失败，桥接会自动退回纯文本回复。
 
 ## 启动和停止
@@ -143,6 +145,29 @@ status
 同步编号 `1` 的输出 10 分钟。同步只在有新事件时推送，不会定期刷屏。
 
 ```text
+cd /path
+pwd
+```
+
+设置/查看本聊天窗口默认工作目录（新任务会用这个目录）。
+
+```text
+debug on
+debug off
+```
+
+控制卡片折叠区的详细程度（默认 `off`）。
+
+```text
+syncmode stream
+syncmode screen
+update on
+update off
+```
+
+同步输出模式。`screen` 会尽量更新同一张卡片（需要 `im:message:update` 权限；失败自动降级为逐条 `stream`）。
+
+```text
 切换 2
 ```
 
@@ -181,6 +206,9 @@ LARK_CODEX_RESULT_FORMAT=card
 LARK_CODEX_DIRECTORY_FORMAT=card
 LARK_CODEX_OUTPUT_STYLE=compact
 LARK_CODEX_DIRECTORY_LIMIT=12
+LARK_CODEX_CARD_SCHEMA=2
+LARK_CODEX_SYNC_RENDER=stream
+LARK_CODEX_ENABLE_MESSAGE_UPDATE=false
 LARK_CODEX_TASK_TIMEOUT_SECONDS=900
 LARK_CODEX_DANGEROUS_BYPASS=false
 ```
@@ -223,11 +251,12 @@ Control your local Codex CLI from a Feishu/Lark bot on your phone. A normal mess
 
 - Send normal bot messages to run Codex tasks.
 - Automatic queueing while Codex is busy.
+- Treat each Feishu/Lark chat (DM/group) as an isolated terminal window (state is per `chat_id`).
 - List Codex sessions and refer to them by number.
 - Keep one local Codex session attached with `切换 1`, so normal messages flow into that session.
-- Follow a session like a lightweight terminal stream.
+- Follow a session like a lightweight terminal stream (silent when nothing changes).
 - Send follow-up messages into the attached session.
-- Display results and session directories as Feishu/Lark cards when possible.
+- Default output uses Card JSON 2.0 (clean main content; extra metadata folded in a collapsed panel).
 - Run in the background with `screen`.
 
 ## Requirements
@@ -279,6 +308,7 @@ Permission guide:
 
 - Basic: receive messages and reply as the bot.
 - Enhanced: also add `im:message.reactions:write_only` for the `OK` acknowledgement reaction.
+- Optional: `im:message:update` for `syncmode screen + update on` (single-card updates; auto-degrades on failure).
 - Interactive cards are sent as message replies. If card sending fails, the bridge falls back to plain text.
 
 ## Start and Stop
@@ -313,6 +343,11 @@ Send these to your Feishu/Lark bot:
 - `同步会话 1 10分钟`: stream session `1` for 10 minutes (only pushes when new events; no periodic keepalive).
 - `切换 2`: switch the attached stream to session `2`.
 - `停止同步`: stop streaming.
+- `cd /path` / `cwd /path`: set the default workdir for new tasks in this chat.
+- `pwd`: show the default workdir for new tasks in this chat.
+- `debug on|off`: control how verbose the folded details panel is.
+- `syncmode stream|screen`: choose sync render mode.
+- `update on|off`: enable/disable message update (required for `screen`).
 - `队列`: show queued messages.
 - `logs`: show recent task logs.
 

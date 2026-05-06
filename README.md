@@ -1,6 +1,6 @@
 # lark-codex-bridge
 
-用飞书/Lark 机器人在手机上远程控制本机 Codex CLI。普通消息会触发 Codex，机器人优先给原消息添加 `OK` 表情表示收到，任务完成后优先回复结构化交互卡片；如果权限或卡片发送失败，会自动退回纯文本。
+用飞书/Lark 机器人在手机上远程控制本机 Codex CLI。每个飞书聊天就是一个手机终端窗口：普通消息会作为 terminal task 发送给 Codex，机器人先给原消息添加 `OK` 表情，再回复一张运行中卡片；后续进度、空闲状态和最终结果优先更新同一张卡片。
 
 > 安全提醒：这个桥接会让指定飞书/Lark 用户远程触发你电脑上的 Codex。公开版默认不开启高权限 bypass。只有你显式设置 `LARK_CODEX_DANGEROUS_BYPASS=true` 时，续接会话才会使用 `--dangerously-bypass-approvals-and-sandbox`。
 
@@ -9,9 +9,11 @@
 - 直接发消息给机器人，让 Codex 执行任务。
 - 忙时自动排队。
 - 每个飞书/Lark 聊天（DM/群）都是一个独立“终端窗口”：状态按 `chat_id` 隔离。
+- 普通消息默认是可恢复 terminal task：长超时、job 记录、超时后可 `continue`。
+- 每个任务优先使用同一张 running card：`QUEUED / RUNNING / PAUSED / DONE / FAILED`。
 - 查看 Codex 会话目录，并用编号选择会话。
 - `切换 1` 后常驻绑定本地 Codex 会话，普通消息会无缝进入当前会话（直到 `清除会话`）。
-- 同步会话进度，像手机上的轻量终端流（默认只在有新事件时推送，完全静默等待）。
+- 同步会话进度，像手机上的轻量终端流（默认只在有新事件时推送；无新内容时只更新同卡状态行）。
 - 在同步期间直接给当前会话继续发消息。
 - 输出默认使用 Card JSON 2.0：主内容清爽可读，元信息放在折叠区（默认收起）。
 - 支持长任务：更长超时、任务记录、部分产物追踪，以及失败后 `继续任务`。
@@ -66,7 +68,7 @@ LARK_CODEX_ALLOWED_SENDER=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 - 基础体验：接收消息、以机器人身份回复消息。
 - 完整体验：再添加 `im:message.reactions:write_only`，用于收到消息后添加 `OK` 表情。
-- 可选增强：`im:message:update`，用于 `syncmode screen + update on` 时更新同一张卡片（失败会自动降级，不影响核心功能）。
+- 完整 TUI：再添加 `im:message:update`，用于把进度和最终结果 patch 到同一张 running card（失败会自动降级，不影响核心功能）。
 - 交互卡片通过消息回复发送；如果卡片发送失败，桥接会自动退回纯文本回复。
 
 ## 启动和停止
@@ -91,6 +93,8 @@ tail -f ~/.lark-codex/bridge.log
 
 在飞书/Lark 机器人里发送：
 
+终端风格命令是主入口；中文命令继续兼容。
+
 ```text
 status
 ```
@@ -101,7 +105,11 @@ status
 目录
 ```
 
-用卡片列出当前会话、置顶会话和最近会话编号。
+用卡片列出当前会话、置顶会话和最近会话编号。也支持：
+
+```text
+sessions
+```
 
 ```text
 切换 1
@@ -113,25 +121,29 @@ status
 
 ```text
 常驻 1
+attach 1
 ```
 
 ```text
 当前会话
+current
 ```
 
 查看当前绑定的本地 Codex 会话。
 
 ```text
 清除会话
+detach
 ```
 
 取消当前会话绑定。之后普通消息会创建新任务。
 
 ```text
 新任务 帮我整理这个仓库
+new 帮我整理这个仓库
 ```
 
-绕过当前会话，强制创建一个新的 Codex 任务，但不把它设为常驻会话。
+绕过当前会话，强制创建一个新的 terminal task，但不把它设为常驻会话。默认仍使用可恢复长任务模型。
 
 ```text
 新会话 帮我整理这个仓库
@@ -153,12 +165,14 @@ status
 
 ```text
 任务
+tasks
 ```
 
-查看最近长任务状态、原始需求、尝试次数、已记录产物和下一步命令。
+`任务` 查看最近长任务状态、原始需求、尝试次数、已记录产物和下一步命令。`tasks` 列出最近任务。
 
 ```text
 继续任务
+continue
 ```
 
 从最近失败或暂停的长任务继续。桥接会把原始需求、已记录产物和最近日志摘要一起发给 Codex，避免从头重做。若旧版本没有长任务记录，但当前窗口已有常驻会话，也会自动升级为长任务继续。
@@ -238,6 +252,9 @@ LARK_CODEX_DIRECTORY_FORMAT=card
 LARK_CODEX_OUTPUT_STYLE=compact
 LARK_CODEX_DIRECTORY_LIMIT=12
 LARK_CODEX_CARD_SCHEMA=2
+LARK_CODEX_TASK_MODE=auto-long
+LARK_CODEX_TERMINAL_RENDER=screen
+LARK_CODEX_IDLE_STATUS_PATCH_SECONDS=60
 LARK_CODEX_SYNC_RENDER=stream
 LARK_CODEX_ENABLE_MESSAGE_UPDATE=false
 LARK_CODEX_TASK_TIMEOUT_SECONDS=900
@@ -246,6 +263,12 @@ LARK_CODEX_DANGEROUS_BYPASS=false
 ```
 
 `LARK_CODEX_WORKDIR` 是新建 Codex 任务时使用的默认工作目录。续接已有会话时，Codex 会使用会话自己的上下文。
+
+`LARK_CODEX_TASK_MODE=auto-long` 表示普通消息默认按可恢复 terminal task 执行；如需旧行为可设为 `explicit-long`，只有 `长任务` / `long` 进入长任务模式。
+
+`LARK_CODEX_TERMINAL_RENDER=screen` 表示任务进度优先更新同一张 running card；如果缺少 `im:message:update` 权限，会自动降级为逐条卡片或纯文本 fallback。
+
+`LARK_CODEX_IDLE_STATUS_PATCH_SECONDS=60` 表示长时间无新输出时最多每 60 秒更新同一张卡片状态行；设为 `0` 可禁用空闲状态更新。
 
 ## 高权限模式
 
@@ -275,7 +298,7 @@ LARK_CODEX_DANGEROUS_BYPASS=true
 
 # English
 
-Control your local Codex CLI from a Feishu/Lark bot on your phone. A normal message triggers Codex. The bot first tries to add an `OK` reaction to the original message, then sends a structured interactive card when the task completes. If reactions or cards are unavailable, it falls back to plain text.
+Control your local Codex CLI from a Feishu/Lark bot on your phone. Each Feishu/Lark chat behaves like a mobile terminal window: a normal message starts a terminal task, the bot adds an `OK` reaction, posts a running card, then patches progress, idle status, and final output into the same card whenever possible.
 
 > Security note: this bridge lets one configured Feishu/Lark user remotely trigger Codex on your computer. Dangerous bypass mode is off by default. It is only enabled when you explicitly set `LARK_CODEX_DANGEROUS_BYPASS=true`.
 
@@ -284,6 +307,8 @@ Control your local Codex CLI from a Feishu/Lark bot on your phone. A normal mess
 - Send normal bot messages to run Codex tasks.
 - Automatic queueing while Codex is busy.
 - Treat each Feishu/Lark chat (DM/group) as an isolated terminal window (state is per `chat_id`).
+- Normal messages default to recoverable terminal tasks (`auto-long`).
+- Tasks prefer one running card with `QUEUED / RUNNING / PAUSED / DONE / FAILED` states.
 - List Codex sessions and refer to them by number.
 - Keep one local Codex session attached with `切换 1`, so normal messages flow into that session.
 - Follow a session like a lightweight terminal stream (silent when nothing changes).
@@ -341,7 +366,7 @@ Permission guide:
 
 - Basic: receive messages and reply as the bot.
 - Enhanced: also add `im:message.reactions:write_only` for the `OK` acknowledgement reaction.
-- Optional: `im:message:update` for `syncmode screen + update on` (single-card updates; auto-degrades on failure).
+- Full TUI: also add `im:message:update` for single-card progress/final updates; auto-degrades on failure.
 - Interactive cards are sent as message replies. If card sending fails, the bridge falls back to plain text.
 
 ## Start and Stop
@@ -368,7 +393,7 @@ Send these to your Feishu/Lark bot:
 
 - `status`: show bridge status.
 - `目录` or `sessions`: list Codex sessions.
-- `切换 1` / `常驻 1`: set session `1` as the persistent current session.
+- `attach 1` / `切换 1` / `常驻 1`: set session `1` as the persistent current session.
 - `当前会话` or `current`: show the current target session.
 - `清除会话` or `detach`: clear the current target session.
 - `新任务 <content>` or `new <content>`: force a new Codex task instead of using the current session.
@@ -376,7 +401,8 @@ Send these to your Feishu/Lark bot:
 - `新会话` / `new session`: make the next normal message create and attach a new session.
 - `长任务 <content>` / `long <content>`: run an extended-timeout job.
 - `任务` / `task`: show the latest long job.
-- `继续任务` / `continue task`: resume the latest failed or paused long job. If no long-job record exists but a session is attached, it upgrades the continuation into a long job.
+- `tasks` / `jobs`: list recent jobs.
+- `继续任务` / `continue` / `continue task`: resume the latest failed or paused job. If no long-job record exists but a session is attached, it upgrades the continuation into a long job.
 - `会话 1`: show recent progress for session `1`.
 - `同步会话 1 10分钟`: stream session `1` for 10 minutes (only pushes when new events; no periodic keepalive).
 - `切换 2`: switch the attached stream to session `2`.

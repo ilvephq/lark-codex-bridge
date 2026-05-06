@@ -13,6 +13,9 @@ CODEX_MODEL="${LARK_CODEX_MODEL:-gpt-5.2}"
 CODEX_BIN="${LARK_CODEX_BIN:-codex}"
 CODEX_TASK_TIMEOUT_SECONDS="${LARK_CODEX_TASK_TIMEOUT_SECONDS:-900}"
 CODEX_LONG_TASK_TIMEOUT_SECONDS="${LARK_CODEX_LONG_TASK_TIMEOUT_SECONDS:-3600}"
+TASK_MODE="${LARK_CODEX_TASK_MODE:-auto-long}"
+TERMINAL_RENDER="${LARK_CODEX_TERMINAL_RENDER:-screen}"
+IDLE_STATUS_PATCH_SECONDS="${LARK_CODEX_IDLE_STATUS_PATCH_SECONDS:-60}"
 ACK_EMOJI="${LARK_CODEX_ACK_EMOJI:-👀}"
 ACK_MODE="${LARK_CODEX_ACK_MODE:-reaction}"
 ACK_REACTION_EMOJI="${LARK_CODEX_ACK_REACTION_EMOJI:-OK}"
@@ -46,6 +49,8 @@ ACTIVE_SESSION_FILE=""
 NEW_SESSION_FILE=""
 JOBS_DIR=""
 LATEST_JOB_FILE=""
+RUNNING_CARDS_DIR=""
+TERMINAL_BUFFERS_DIR=""
 SYNC_FILE=""
 SYNC_STOP_FILE=""
 SYNC_LOCK_DIR=""
@@ -62,8 +67,19 @@ SYNC_SCREEN_MAX_LINES="${LARK_CODEX_SYNC_SCREEN_MAX_LINES:-180}"
 if [[ "$OUTPUT_STYLE" != "compact" && "$OUTPUT_STYLE" != "verbose" ]]; then
   OUTPUT_STYLE="compact"
 fi
+case "$TASK_MODE" in
+  auto-long|explicit-long) ;;
+  *) TASK_MODE="auto-long" ;;
+esac
+case "$TERMINAL_RENDER" in
+  screen|stream) ;;
+  *) TERMINAL_RENDER="screen" ;;
+esac
 if [[ ! "$DIRECTORY_LIMIT" =~ ^[0-9]+$ ]]; then
   DIRECTORY_LIMIT=12
+fi
+if [[ ! "$IDLE_STATUS_PATCH_SECONDS" =~ ^[0-9]+$ ]]; then
+  IDLE_STATUS_PATCH_SECONDS=60
 fi
 if [[ ! "$CODEX_TASK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
   CODEX_TASK_TIMEOUT_SECONDS=900
@@ -153,6 +169,18 @@ short_id() {
   first="${id:0:8}"
   last="${id#${id%????}}"
   printf '%s...%s' "$first" "$last"
+}
+
+short_path() {
+  local path="${1:-}"
+
+  [[ -n "$path" ]] || return 0
+  if [[ "$path" == "$HOME" ]]; then
+    path="~"
+  elif [[ "$path" == "$HOME/"* ]]; then
+    path="~/${path#"$HOME/"}"
+  fi
+  printf '%s' "$path" | compact_text 48
 }
 
 safe_fs_id() {
@@ -270,11 +298,13 @@ chat_context_load() {
   NEW_SESSION_FILE="$CHAT_STATE_DIR/new_session_pending.json"
   JOBS_DIR="$CHAT_STATE_DIR/jobs"
   LATEST_JOB_FILE="$CHAT_STATE_DIR/latest_job.json"
+  RUNNING_CARDS_DIR="$CHAT_STATE_DIR/running_cards"
+  TERMINAL_BUFFERS_DIR="$CHAT_STATE_DIR/terminal_buffers"
   SYNC_FILE="$CHAT_STATE_DIR/sync.json"
   SYNC_STOP_FILE="$CHAT_STATE_DIR/sync.stop"
   SYNC_LOCK_DIR="$CHAT_STATE_DIR/sync.lock"
 
-  mkdir -p "$CHAT_STATE_DIR" "$JOBS_DIR"
+  mkdir -p "$CHAT_STATE_DIR" "$JOBS_DIR" "$RUNNING_CARDS_DIR" "$TERMINAL_BUFFERS_DIR"
   chat_settings_ensure
   chat_settings_load_into_vars
 }
@@ -541,6 +571,9 @@ result_card_json() {
   if [[ "$status" == "success" ]]; then
     title="✅ 完成"
     template="green"
+  elif [[ "$status" == "paused" ]]; then
+    title="PAUSED Codex"
+    template="orange"
   else
     title="❌ 失败"
     template="red"
@@ -590,8 +623,24 @@ reply_result() {
 
   if [[ "$status" == "success" ]]; then
     fallback="$(final_reply_text "$answer")"
+  elif [[ "$status" == "paused" ]]; then
+    fallback="$(printf 'PAUSED\n\n%s\n\n发送 continue 继续。' "$answer")"
   else
     fallback="$(failed_reply_text "$answer")"
+  fi
+
+  if [[ -f "$(terminal_card_file_path "$message_id")" ]]; then
+    if [[ "$status" == "success" ]]; then
+      terminal_update_card "$message_id" "DONE" "$answer" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" "" "" "true"
+      add_reaction "$message_id" "DONE" || true
+      rm -f "$(terminal_card_file_path "$message_id")"
+    elif [[ "$status" == "paused" ]]; then
+      terminal_update_card "$message_id" "PAUSED" "$answer" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" "" "send: continue" "true"
+    else
+      terminal_update_card "$message_id" "FAILED" "$answer" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" "" "send: logs" "true"
+      rm -f "$(terminal_card_file_path "$message_id")"
+    fi
+    return
   fi
 
   if [[ "$RESULT_FORMAT" == "card" ]]; then
@@ -613,6 +662,338 @@ reply_notice() {
 
   card="$(card_json "$title" "$template" "$body" "$detail")"
   reply_card "$message_id" "$card" || reply_text "$message_id" "$fallback"
+}
+
+terminal_card_file_path() {
+  local source_message_id="$1"
+  printf '%s/%s.json' "$RUNNING_CARDS_DIR" "$(safe_fs_id "$source_message_id")"
+}
+
+terminal_buffer_file_path() {
+  local source_message_id="$1"
+  printf '%s/%s.buffer' "$TERMINAL_BUFFERS_DIR" "$(safe_fs_id "$source_message_id")"
+}
+
+terminal_stop_file_path() {
+  local source_message_id="$1"
+  printf '%s/%s.stop' "$TERMINAL_BUFFERS_DIR" "$(safe_fs_id "$source_message_id")"
+}
+
+terminal_card_id() {
+  local source_message_id="$1"
+  local file
+
+  file="$(terminal_card_file_path "$source_message_id")"
+  [[ -f "$file" ]] || return 1
+  jq -r '.card_message_id // empty' "$file" 2>/dev/null | head -n 1
+}
+
+terminal_card_degraded() {
+  local source_message_id="$1"
+  local file
+
+  file="$(terminal_card_file_path "$source_message_id")"
+  [[ -f "$file" ]] || return 1
+  [[ "$(jq -r '.degraded // false' "$file" 2>/dev/null || true)" == "true" ]]
+}
+
+terminal_store_card() {
+  local source_message_id="$1"
+  local card_message_id="${2:-}"
+  local state="${3:-RUNNING}"
+  local degraded="${4:-false}"
+  local file
+
+  file="$(terminal_card_file_path "$source_message_id")"
+  jq -n \
+    --arg source_message_id "$source_message_id" \
+    --arg card_message_id "$card_message_id" \
+    --arg state "$state" \
+    --arg updated_at "$(timestamp)" \
+    --arg degraded "$degraded" \
+    '{
+      source_message_id:$source_message_id,
+      card_message_id:$card_message_id,
+      state:$state,
+      degraded:($degraded == "true"),
+      updated_at:$updated_at
+    }' >"$file"
+}
+
+terminal_update_card_state() {
+  local source_message_id="$1"
+  local state="$2"
+  local degraded="${3:-}"
+  local file tmp
+
+  file="$(terminal_card_file_path "$source_message_id")"
+  [[ -f "$file" ]] || return 0
+  tmp="$file.$$"
+  jq \
+    --arg state "$state" \
+    --arg degraded "$degraded" \
+    --arg updated_at "$(timestamp)" \
+    '.state = $state
+      | .updated_at = $updated_at
+      | if $degraded != "" then .degraded = ($degraded == "true") else . end' \
+    "$file" >"$tmp"
+  mv "$tmp" "$file"
+}
+
+terminal_state_template() {
+  case "$1" in
+    DONE) printf 'green' ;;
+    FAILED) printf 'red' ;;
+    PAUSED) printf 'orange' ;;
+    QUEUED) printf 'yellow' ;;
+    *) printf 'blue' ;;
+  esac
+}
+
+terminal_state_title() {
+  local state="$1"
+
+  case "$state" in
+    DONE) printf 'DONE Codex' ;;
+    FAILED) printf 'FAILED Codex' ;;
+    PAUSED) printf 'PAUSED Codex' ;;
+    QUEUED) printf 'QUEUED Codex' ;;
+    STARTING) printf 'STARTING Codex' ;;
+    *) printf 'RUNNING Codex' ;;
+  esac
+}
+
+terminal_session_label() {
+  local session_id="${1:-}"
+  local number title
+
+  if [[ -z "$session_id" ]]; then
+    printf 'new'
+    return
+  fi
+  number="$(session_alias_number "$session_id" || true)"
+  title="$(session_title "$session_id")"
+  if [[ -n "$number" ]]; then
+    printf '#%s %s' "$number" "$title"
+  else
+    printf '%s' "$(short_id "$session_id")"
+  fi
+}
+
+terminal_safe_fence_text() {
+  perl -CS -Mutf8 -0pe 's/```/`\x{200b}``/g'
+}
+
+terminal_card_json() {
+  local state="$1"
+  local output="$2"
+  local task_id="${3:-}"
+  local prompt="${4:-}"
+  local session_id="${5:-}"
+  local elapsed_seconds="${6:-0}"
+  local job_id="${7:-}"
+  local error_detail="${8:-}"
+  local title template body detail session_label cwd queue prompt_short output_text
+
+  [[ "$elapsed_seconds" =~ ^[0-9]+$ ]] || elapsed_seconds=0
+  title="$(terminal_state_title "$state")"
+  template="$(terminal_state_template "$state")"
+  session_label="$(terminal_session_label "$session_id")"
+  cwd="$(short_path "${CHAT_WORKDIR:-$CODEX_WORKDIR}")"
+  queue="$(queue_count)"
+  prompt_short="$(printf '%s' "$prompt" | compact_text 260)"
+  output_text="$(printf '%s' "$output" | terminal_safe_fence_text)"
+  if [[ -z "$output_text" ]]; then
+    case "$state" in
+      QUEUED) output_text="queued: $prompt_short" ;;
+      PAUSED) output_text="task paused. send: continue" ;;
+      DONE) output_text="done." ;;
+      FAILED) output_text="task failed. send: logs" ;;
+      *) output_text="working..." ;;
+    esac
+  fi
+
+  body=$(
+    printf '```text\n%s\n```\n\n' "$output_text"
+    printf '`%s` elapsed %ss | queue %s | session %s | cwd %s\n' \
+      "$state" "$elapsed_seconds" "$queue" "$session_label" "$cwd"
+  )
+
+  detail=$(
+    [[ -n "$prompt_short" ]] && printf '**prompt**：%s\n' "$prompt_short"
+    [[ -n "$task_id" ]] && printf '**task_id**：%s\n' "$task_id"
+    [[ -n "$job_id" ]] && printf '**job_id**：%s\n' "$job_id"
+    [[ -n "$session_id" ]] && printf '**session_id**：%s\n' "$session_id"
+    printf '**workdir**：%s\n' "${CHAT_WORKDIR:-$CODEX_WORKDIR}"
+    printf '**queue**：%s\n' "$queue"
+    if [[ -n "$error_detail" ]]; then
+      printf '\n%s\n' "$error_detail"
+    fi
+    printf '\ncommands: sessions / current / attach N / detach / continue / task / queue / logs\n'
+  )
+
+  card_json "$title" "$template" "$body" "$detail"
+}
+
+terminal_plain_text() {
+  local state="$1"
+  local output="$2"
+
+  printf '%s\n\n%s' "$state" "$output"
+}
+
+terminal_create_card() {
+  local source_message_id="$1"
+  local state="$2"
+  local output="$3"
+  local task_id="${4:-}"
+  local prompt="${5:-}"
+  local session_id="${6:-}"
+  local elapsed_seconds="${7:-0}"
+  local job_id="${8:-}"
+  local error_detail="${9:-}"
+  local card new_id buffer_file
+
+  buffer_file="$(terminal_buffer_file_path "$source_message_id")"
+  : >"$buffer_file" 2>/dev/null || true
+  card="$(terminal_card_json "$state" "$output" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" "$job_id" "$error_detail")"
+
+  if [[ "$TERMINAL_RENDER" == "screen" ]]; then
+    if new_id="$(reply_card_capture_message_id "$source_message_id" "$card" 2>/dev/null)"; then
+      terminal_store_card "$source_message_id" "$new_id" "$state" "false"
+      return 0
+    fi
+  fi
+
+  terminal_store_card "$source_message_id" "" "$state" "true"
+  reply_card "$source_message_id" "$card" || reply_text "$source_message_id" "$(terminal_plain_text "$state" "$output")"
+}
+
+terminal_update_card() {
+  local source_message_id="$1"
+  local state="$2"
+  local output="$3"
+  local task_id="${4:-}"
+  local prompt="${5:-}"
+  local session_id="${6:-}"
+  local elapsed_seconds="${7:-0}"
+  local job_id="${8:-}"
+  local error_detail="${9:-}"
+  local stream_on_degrade="${10:-true}"
+  local card card_id
+
+  if [[ ! -f "$(terminal_card_file_path "$source_message_id")" ]]; then
+    terminal_create_card "$source_message_id" "$state" "$output" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" "$job_id" "$error_detail"
+    return
+  fi
+
+  card="$(terminal_card_json "$state" "$output" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" "$job_id" "$error_detail")"
+  card_id="$(terminal_card_id "$source_message_id" || true)"
+  if [[ "$TERMINAL_RENDER" == "screen" && -n "$card_id" ]] && ! terminal_card_degraded "$source_message_id"; then
+    if update_interactive_message "$card_id" "$card"; then
+      terminal_update_card_state "$source_message_id" "$state"
+      return 0
+    fi
+    terminal_update_card_state "$source_message_id" "$state" "true"
+  else
+    terminal_update_card_state "$source_message_id" "$state"
+  fi
+
+  if [[ "$stream_on_degrade" == "true" ]]; then
+    reply_card "$source_message_id" "$card" || reply_text "$source_message_id" "$(terminal_plain_text "$state" "$output")"
+  fi
+}
+
+terminal_append_output() {
+  local source_message_id="$1"
+  local delta="$2"
+  local buffer_file
+
+  [[ -n "$delta" ]] || return 0
+  buffer_file="$(terminal_buffer_file_path "$source_message_id")"
+  {
+    [[ -f "$buffer_file" ]] && cat "$buffer_file" || true
+    printf '%s\n' "$delta"
+  } | tail -n "${SYNC_SCREEN_MAX_LINES:-180}" >"$buffer_file.$$"
+  mv "$buffer_file.$$" "$buffer_file"
+}
+
+terminal_buffer_text() {
+  local source_message_id="$1"
+  local fallback="${2:-working...}"
+  local buffer_file
+
+  buffer_file="$(terminal_buffer_file_path "$source_message_id")"
+  if [[ -s "$buffer_file" ]]; then
+    cat "$buffer_file"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+session_line_count() {
+  local session_id="$1"
+  local file
+
+  file="$(find_session_file "$session_id")"
+  [[ -n "$file" && -f "$file" ]] || { printf '0'; return; }
+  wc -l <"$file" | tr -d ' '
+}
+
+terminal_progress_loop() {
+  local source_message_id="$1"
+  local task_id="$2"
+  local prompt="$3"
+  local session_id="${4:-}"
+  local started_ms="$5"
+  local started_epoch="$6"
+  local job_id="${7:-}"
+  local codex_pid="$8"
+  local stop_file="$9"
+  local initial_lines="${10:-0}"
+  local last_lines current_lines first_line delta output now elapsed last_patch discovered_session
+
+  [[ "$initial_lines" =~ ^[0-9]+$ ]] || initial_lines=0
+  last_lines="$initial_lines"
+  last_patch="$(date '+%s')"
+
+  while kill -0 "$codex_pid" 2>/dev/null; do
+    [[ ! -f "$stop_file" ]] || break
+    now="$(date '+%s')"
+    elapsed=$((now - started_epoch))
+
+    if [[ -z "$session_id" ]]; then
+      discovered_session="$(latest_created_session_id_since "$started_ms" "${CHAT_WORKDIR:-$CODEX_WORKDIR}" || true)"
+      if [[ -n "$discovered_session" ]]; then
+        session_id="$discovered_session"
+        last_lines=0
+        [[ -n "$job_id" ]] && job_update_state "$job_id" "running" "$task_id" "$source_message_id" "$prompt" "$session_id" "" ""
+      fi
+    fi
+
+    if [[ -n "$session_id" ]]; then
+      current_lines="$(session_line_count "$session_id")"
+      if [[ "$current_lines" =~ ^[0-9]+$ && "$last_lines" =~ ^[0-9]+$ && "$current_lines" -gt "$last_lines" ]]; then
+        first_line=$((last_lines + 1))
+        delta="$(session_stream_text "$session_id" "$first_line" 36 false)"
+        if [[ -n "$delta" ]]; then
+          terminal_append_output "$source_message_id" "$delta"
+          output="$(terminal_buffer_text "$source_message_id")"
+          terminal_update_card "$source_message_id" "RUNNING" "$output" "$task_id" "$prompt" "$session_id" "$elapsed" "$job_id" "" "true" || true
+          last_patch="$now"
+        fi
+        last_lines="$current_lines"
+      fi
+    fi
+
+    if ((IDLE_STATUS_PATCH_SECONDS > 0 && now - last_patch >= IDLE_STATUS_PATCH_SECONDS)); then
+      output="$(terminal_buffer_text "$source_message_id" "working...")"
+      terminal_update_card "$source_message_id" "RUNNING" "$output" "$task_id" "$prompt" "$session_id" "$elapsed" "$job_id" "" "false" || true
+      last_patch="$now"
+    fi
+
+    sleep 5
+  done
 }
 
 set_status() {
@@ -838,7 +1219,7 @@ job_summary_text() {
   [[ -n "$last_error" ]] && printf '失败原因:\n%s\n\n' "$last_error"
   printf '产物:\n%s\n\n' "$artifacts"
   case "$state" in
-    failed|timeout|queued)
+    failed|timeout|paused|queued)
       printf '下一步: 发送 继续任务'
       ;;
     running)
@@ -848,6 +1229,32 @@ job_summary_text() {
       printf '下一步: 如需继续迭代，发送 长任务 <新需求>。'
       ;;
   esac
+}
+
+jobs_list_text() {
+  local file state updated prompt session_id title job_id count
+
+  count=0
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    count=$((count + 1))
+    job_id="$(jq -r '.job_id // empty' "$file" 2>/dev/null || true)"
+    state="$(jq -r '.state // "unknown"' "$file" 2>/dev/null || true)"
+    updated="$(jq -r '.updated_at // ""' "$file" 2>/dev/null || true)"
+    prompt="$(jq -r '.original_prompt // .prompt // ""' "$file" 2>/dev/null | compact_text 120)"
+    session_id="$(jq -r '.session_id // empty' "$file" 2>/dev/null || true)"
+    title=""
+    [[ -n "$session_id" ]] && title="$(session_title "$session_id")"
+    printf '[%s] %s  %s\n' "$count" "$state" "$updated"
+    [[ -n "$title" ]] && printf 'session: %s\n' "$title"
+    printf '%s\n' "$prompt"
+    [[ -n "$job_id" ]] && printf 'id: %s\n' "$job_id"
+    printf '\n'
+  done < <(find "$JOBS_DIR" -type f -name '*.json' 2>/dev/null | sort | tail -n 8)
+
+  if ((count == 0)); then
+    printf 'no tasks yet. send a normal message to start one.'
+  fi
 }
 
 job_continue_prompt() {
@@ -950,6 +1357,9 @@ recover_stale_running_lock() {
   ((mtime > 0)) || return 0
 
   stale_after=$((CODEX_TASK_TIMEOUT_SECONDS + 120))
+  if ((CODEX_LONG_TASK_TIMEOUT_SECONDS + 120 > stale_after)); then
+    stale_after=$((CODEX_LONG_TASK_TIMEOUT_SECONDS + 120))
+  fi
   age=$((now - mtime))
   ((age >= stale_after)) || return 0
 
@@ -1075,6 +1485,8 @@ enqueue_task() {
     '{task_id:$task_id,message_id:$message_id,chat_id:$chat_id,prompt:$prompt,session_id:$session_id,reply_mode:$reply_mode,job_id:$job_id,timeout_seconds:$timeout_seconds,queued_at:$queued_at}' \
     >"$tmp"
   mv "$tmp" "$filename"
+  [[ -n "$job_id" ]] && job_update_state "$job_id" "queued" "$task_id" "$message_id" "$prompt" "$session_id" "" "queued"
+  terminal_create_card "$message_id" "QUEUED" "queued: $(printf '%s' "$prompt" | compact_text 220)" "$task_id" "$prompt" "$session_id" "0" "$job_id" "" || true
 
   : # queued
 }
@@ -1107,8 +1519,8 @@ queue_text() {
       printf '[%s] %s -> %s\n%s\n\n' "$index" "$queued_at" "$title" "$prompt"
     elif [[ "$reply_mode" == "new_session" ]]; then
       printf '[%s] %s -> 新会话\n%s\n\n' "$index" "$queued_at" "$prompt"
-    elif [[ "$reply_mode" == "long" ]]; then
-      printf '[%s] %s -> 长任务\n%s\n\n' "$index" "$queued_at" "$prompt"
+    elif [[ "$reply_mode" == "long" || "$reply_mode" == "auto-long" ]]; then
+      printf '[%s] %s -> terminal task\n%s\n\n' "$index" "$queued_at" "$prompt"
     else
       printf '[%s] %s -> 新任务\n%s\n\n' "$index" "$queued_at" "$prompt"
     fi
@@ -1195,6 +1607,7 @@ logs_text() {
 
 redact_log() {
   sed -E \
+    -e '/event type: im\.message\.reaction\.created_v1, not found handler/d' \
     -e 's/(LARKSUITE_CLI_APP_SECRET=)[^[:space:]]+/\1[redacted]/g' \
     -e 's/(FEISHU_APP_SECRET=)[^[:space:]]+/\1[redacted]/g' \
     -e 's/(tenant_access_token["=: ]+)[^",[:space:]]+/\1[redacted]/g' \
@@ -2148,38 +2561,41 @@ stop_sync() {
 start_new_session_task() {
   local message_id="$1"
   local prompt="$2"
-  local task_id
+  local task_id job_id
 
   clear_new_session_pending
+  job_id="$(create_long_job "$message_id" "$prompt" "" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "new_session")"
   if ! try_acquire_running_lock; then
-    enqueue_task "$message_id" "$prompt" "" "new_session"
+    enqueue_task "$message_id" "$prompt" "" "new_session" "${CHAT_ID:-unknown}" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id"
     return
   fi
 
   task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
   set_status "queued" "$task_id" "$message_id" "$prompt" "将创建新会话并常驻"
-  run_codex_task "$task_id" "$message_id" "$prompt" "" "new_session" &
+  terminal_create_card "$message_id" "RUNNING" "starting new session..." "$task_id" "$prompt" "" "0" "$job_id" "" || true
+  run_codex_task "$task_id" "$message_id" "$prompt" "" "new_session" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id" &
 }
 
 start_long_task() {
   local message_id="$1"
   local prompt="$2"
   local session_id="${3:-}"
+  local use_active="${4:-true}"
   local job_id task_id
 
-  [[ -n "$session_id" ]] || session_id="$(active_session_id || true)"
+  if [[ -z "$session_id" && "$use_active" == "true" ]]; then
+    session_id="$(active_session_id || true)"
+  fi
   job_id="$(create_long_job "$message_id" "$prompt" "$session_id" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "long")"
 
   if ! try_acquire_running_lock; then
     enqueue_task "$message_id" "$prompt" "$session_id" "long" "${CHAT_ID:-unknown}" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id"
-    job_update_state "$job_id" "queued" "" "$message_id" "$prompt" "$session_id" "" "前面有任务正在运行，已排队。"
-    reply_notice "$message_id" "长任务已排队" "blue" "$(job_summary_text "$job_id")" "命令：任务 / 队列" "长任务已排队。发送 任务 查看。"
     return
   fi
 
   task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
   set_status "queued" "$task_id" "$message_id" "$prompt" "长任务已启动，超时 ${CODEX_LONG_TASK_TIMEOUT_SECONDS}s"
-  reply_notice "$message_id" "长任务已启动" "blue" "$(job_summary_text "$job_id")" "命令：任务 / logs / 继续任务" "长任务已启动。发送 任务 查看。"
+  terminal_create_card "$message_id" "RUNNING" "working..." "$task_id" "$prompt" "$session_id" "0" "$job_id" "" || true
   run_codex_task "$task_id" "$message_id" "$prompt" "$session_id" "long" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id" &
 }
 
@@ -2200,14 +2616,12 @@ continue_long_task() {
     job_id="$(create_long_job "$message_id" "$prompt" "$session_id" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "long")"
     if ! try_acquire_running_lock; then
       enqueue_task "$message_id" "$prompt" "$session_id" "long" "${CHAT_ID:-unknown}" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id"
-      job_update_state "$job_id" "queued" "" "$message_id" "$prompt" "$session_id" "" "旧任务继续已升级为长任务并排队。"
-      reply_notice "$message_id" "继续任务已排队" "blue" "$(job_summary_text "$job_id")" "命令：任务 / 队列" "继续任务已排队。"
       return
     fi
 
     task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
     set_status "queued" "$task_id" "$message_id" "$prompt" "旧任务继续已升级为长任务"
-    reply_notice "$message_id" "继续长任务" "blue" "$(job_summary_text "$job_id")" "命令：任务 / logs" "正在继续长任务。"
+    terminal_create_card "$message_id" "RUNNING" "continuing..." "$task_id" "$prompt" "$session_id" "0" "$job_id" "" || true
     run_codex_task "$task_id" "$message_id" "$prompt" "$session_id" "long" "$CODEX_LONG_TASK_TIMEOUT_SECONDS" "$job_id" &
     return
   fi
@@ -2216,6 +2630,14 @@ continue_long_task() {
   state="$(jq -r '.state // empty' "$job_file")"
   if [[ "$state" == "running" ]]; then
     reply_notice "$message_id" "长任务运行中" "blue" "$(job_summary_text "$job_id")" "命令：任务 / logs" "长任务仍在运行。"
+    return
+  fi
+  if [[ "$state" == "queued" ]]; then
+    reply_notice "$message_id" "任务已在队列中" "blue" "$(job_summary_text "$job_id")" "命令：tasks / queue" "任务已在队列中。"
+    return
+  fi
+  if [[ "$state" == "completed" ]]; then
+    reply_notice "$message_id" "任务已完成" "green" "$(job_summary_text "$job_id")" "继续迭代请直接发送新消息，或发送 new <内容>。" "任务已完成。继续迭代请直接发送新消息。"
     return
   fi
 
@@ -2227,14 +2649,12 @@ continue_long_task() {
 
   if ! try_acquire_running_lock; then
     enqueue_task "$message_id" "$prompt" "$session_id" "long" "${CHAT_ID:-unknown}" "$timeout_seconds" "$job_id"
-    job_update_state "$job_id" "queued" "" "$message_id" "$prompt" "$session_id" "" "继续任务已排队。"
-    reply_notice "$message_id" "继续任务已排队" "blue" "$(job_summary_text "$job_id")" "命令：任务 / 队列" "继续任务已排队。"
     return
   fi
 
   task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
   set_status "queued" "$task_id" "$message_id" "$prompt" "正在继续长任务"
-  reply_notice "$message_id" "继续长任务" "blue" "$(job_summary_text "$job_id")" "命令：任务 / logs" "正在继续长任务。"
+  terminal_create_card "$message_id" "RUNNING" "continuing..." "$task_id" "$prompt" "$session_id" "0" "$job_id" "" || true
   run_codex_task "$task_id" "$message_id" "$prompt" "$session_id" "long" "$timeout_seconds" "$job_id" &
 }
 
@@ -2250,11 +2670,15 @@ run_codex_task() {
   local started_epoch started_ms elapsed_seconds
   local resume_args=()
   local new_session_id
-  local failure_answer failure_reason
+  local failure_answer failure_reason result_status
+  local progress_pid="" progress_stop_file="" progress_initial_lines=0
 
   [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds="$CODEX_TASK_TIMEOUT_SECONDS"
   started_epoch="$(date '+%s')"
   started_ms=$((started_epoch * 1000))
+  if [[ -n "$session_id" ]]; then
+    progress_initial_lines="$(session_line_count "$session_id")"
+  fi
   output_file="$(mktemp -t lark-codex-output.XXXXXX)"
   : >"$TASK_LOG_FILE"
   if [[ -n "$session_id" ]]; then
@@ -2263,6 +2687,7 @@ run_codex_task() {
     set_status "running" "$task_id" "$message_id" "$prompt" "Codex 正在执行"
   fi
   [[ -n "$job_id" ]] && job_update_state "$job_id" "running" "$task_id" "$message_id" "$prompt" "$session_id" "" ""
+  terminal_update_card "$message_id" "RUNNING" "$(terminal_buffer_text "$message_id" "working...")" "$task_id" "$prompt" "$session_id" "0" "$job_id" "" "false" || true
 
   {
     echo "$(timestamp) task_id=$task_id started"
@@ -2290,6 +2715,10 @@ run_codex_task() {
     ) >>"$TASK_LOG_FILE" 2>&1 &
     codex_pid=$!
     write_running_lock_pid "$codex_pid"
+    progress_stop_file="$(terminal_stop_file_path "$message_id")"
+    rm -f "$progress_stop_file"
+    terminal_progress_loop "$message_id" "$task_id" "$prompt" "$session_id" "$started_ms" "$started_epoch" "$job_id" "$codex_pid" "$progress_stop_file" "$progress_initial_lines" &
+    progress_pid=$!
     if wait_with_timeout "$codex_pid" "$timeout_seconds"; then
       codex_exit=0
     else
@@ -2308,11 +2737,21 @@ run_codex_task() {
     ) >>"$TASK_LOG_FILE" 2>&1 &
     codex_pid=$!
     write_running_lock_pid "$codex_pid"
+    progress_stop_file="$(terminal_stop_file_path "$message_id")"
+    rm -f "$progress_stop_file"
+    terminal_progress_loop "$message_id" "$task_id" "$prompt" "$session_id" "$started_ms" "$started_epoch" "$job_id" "$codex_pid" "$progress_stop_file" "$progress_initial_lines" &
+    progress_pid=$!
     if wait_with_timeout "$codex_pid" "$timeout_seconds"; then
       codex_exit=0
     else
       codex_exit=$?
     fi
+  fi
+
+  if [[ -n "${progress_pid:-}" ]]; then
+    [[ -n "$progress_stop_file" ]] && : >"$progress_stop_file"
+    wait "$progress_pid" 2>/dev/null || true
+    [[ -n "$progress_stop_file" ]] && rm -f "$progress_stop_file"
   fi
 
   if [[ -n "$job_id" && -z "$session_id" ]]; then
@@ -2328,10 +2767,12 @@ run_codex_task() {
     local answer
     answer="$(cat "$output_file")"
     [[ -n "$answer" ]] || answer="Codex finished, but did not return a final message."
-    if [[ "$reply_mode" == "new_session" && -z "$session_id" ]]; then
-      new_session_id="$(latest_created_session_id_since "$started_ms" "${CHAT_WORKDIR:-$CODEX_WORKDIR}" || true)"
-      if [[ -n "$new_session_id" ]]; then
-        session_id="$new_session_id"
+    if [[ "$reply_mode" == "new_session" ]]; then
+      if [[ -z "$session_id" ]]; then
+        new_session_id="$(latest_created_session_id_since "$started_ms" "${CHAT_WORKDIR:-$CODEX_WORKDIR}" || true)"
+        [[ -n "$new_session_id" ]] && session_id="$new_session_id"
+      fi
+      if [[ -n "$session_id" ]]; then
         set_active_session "$session_id"
         echo "$(timestamp) task_id=$task_id new_session=$session_id" >>"$TASK_LOG_FILE"
       else
@@ -2348,19 +2789,21 @@ run_codex_task() {
     reply_result "$message_id" "success" "$answer" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" || echo "Failed to reply to $message_id" >&2
   else
     echo "$(timestamp) task_id=$task_id failed" >>"$TASK_LOG_FILE"
-    set_status "failed" "$task_id" "$message_id" "$prompt" "发送 logs 查看最近日志"
     elapsed_seconds=$(($(date '+%s') - started_epoch))
     failure_reason="Codex failed while handling this request."
+    result_status="failed"
     if ((codex_exit == 124)); then
-      failure_reason="任务超过 ${timeout_seconds}s，已自动暂停。"
+      failure_reason="任务超过 ${timeout_seconds}s，已暂停。"
+      result_status="paused"
     fi
+    set_status "$result_status" "$task_id" "$message_id" "$prompt" "发送 continue 继续，或发送 logs 查看最近日志"
     failure_answer="$failure_reason"
     if [[ -n "$job_id" ]]; then
       job_refresh_artifacts "$job_id" || true
-      job_update_state "$job_id" "failed" "$task_id" "$message_id" "$prompt" "$session_id" "$elapsed_seconds" "$failure_reason"
+      job_update_state "$job_id" "$result_status" "$task_id" "$message_id" "$prompt" "$session_id" "$elapsed_seconds" "$failure_reason"
       failure_answer="$(long_task_failure_text "$job_id" "$elapsed_seconds" "$failure_reason")"
     fi
-    reply_result "$message_id" "failed" "$failure_answer" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" || true
+    reply_result "$message_id" "$result_status" "$failure_answer" "$task_id" "$prompt" "$session_id" "$elapsed_seconds" || true
   fi
 
   rm -f "$output_file"
@@ -2417,7 +2860,7 @@ while IFS= read -r line; do
       continue
       ;;
     help|帮助)
-      reply_notice "$message_id" "命令" "blue" "普通消息：发送到当前会话（未绑定会话时创建新任务）\n\n核心：目录 / 切换 N / 清除会话 / 新会话 / 新会话 <内容> / 会话 N / 同步会话 N 10分钟 / 停止同步\n\n长任务：长任务 <内容> / 任务 / 继续任务\n\n终端：cd /path / pwd\n\n诊断：status / logs / 队列 / debug on|off" "" "发送 help 查看命令"
+      reply_notice "$message_id" "terminal help" "blue" "sessions\ncurrent\nattach 1\ndetach\nnew <prompt>\nnew session <prompt>\ncontinue\ntask / tasks\nqueue\nlogs\npwd\ncd /path\n\n普通消息默认进入当前会话；没有当前会话时创建新 terminal task。" "中文命令仍兼容：目录 / 切换 N / 清除会话 / 新会话 / 继续任务 / 队列" "sessions / current / attach 1 / detach / new <prompt> / continue / task / queue / logs / pwd / cd"
       continue
       ;;
     目录|会话目录|sessions|"session list")
@@ -2461,12 +2904,21 @@ while IFS= read -r line; do
     continue
   fi
 
-  if [[ "$prompt" =~ ^(任务|task|job|jobs)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$prompt" =~ ^(tasks|jobs)([[:space:]]+(.+))?$ ]]; then
+    if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+      reply_job_status "$message_id" "${BASH_REMATCH[3]}"
+    else
+      reply_notice "$message_id" "tasks" "blue" "$(jobs_list_text)" "commands: task / continue / queue / logs" "$(jobs_list_text)"
+    fi
+    continue
+  fi
+
+  if [[ "$prompt" =~ ^(任务|task|job)([[:space:]]+(.+))?$ ]]; then
     reply_job_status "$message_id" "${BASH_REMATCH[3]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(继续任务|继续做任务|继续长任务|continue[[:space:]]+task|resume[[:space:]]+task)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$prompt" =~ ^(继续任务|继续做任务|继续长任务|continue[[:space:]]+task|resume[[:space:]]+task|continue|resume)([[:space:]]+(.+))?$ ]]; then
     continue_long_task "$message_id" "${BASH_REMATCH[3]:-}"
     continue
   fi
@@ -2571,6 +3023,10 @@ while IFS= read -r line; do
   if [[ "$prompt" =~ ^(新任务|new)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     clear_new_session_pending
+    if [[ "$TASK_MODE" == "auto-long" ]]; then
+      start_long_task "$message_id" "$prompt" "" "false"
+      continue
+    fi
     if ! try_acquire_running_lock; then
       enqueue_task "$message_id" "$prompt" "" "final"
       continue
@@ -2589,6 +3045,10 @@ while IFS= read -r line; do
 
   attached_session_id="$(active_session_id || true)"
   if [[ -n "$attached_session_id" ]]; then
+    if [[ "$TASK_MODE" == "auto-long" ]]; then
+      start_long_task "$message_id" "$prompt" "$attached_session_id"
+      continue
+    fi
     if ! try_acquire_running_lock; then
       enqueue_task "$message_id" "$prompt" "$attached_session_id" "stream"
       continue
@@ -2597,6 +3057,11 @@ while IFS= read -r line; do
     task_id="$(date '+%Y%m%d%H%M%S')-$message_id"
     set_status "queued" "$task_id" "$message_id" "$prompt" "已发送到会话 $attached_session_id"
     run_codex_task "$task_id" "$message_id" "$prompt" "$attached_session_id" "stream" &
+    continue
+  fi
+
+  if [[ "$TASK_MODE" == "auto-long" ]]; then
+    start_long_task "$message_id" "$prompt" "" "false"
     continue
   fi
 

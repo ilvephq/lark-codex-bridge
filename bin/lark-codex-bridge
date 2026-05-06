@@ -1836,6 +1836,28 @@ session_stream_text() {
   [[ -n "$body" ]] && printf '%s' "$body" || true
 }
 
+session_last_stream_line() {
+  local session_id="$1"
+  local file lines from_line out
+
+  session_id="$(resolve_session_ref "$session_id" || true)"
+  [[ -n "$session_id" ]] || return 1
+
+  file="$(find_session_file "$session_id")"
+  [[ -n "$file" && -f "$file" ]] || return 1
+
+  lines="$(wc -l <"$file" | tr -d ' ')"
+  [[ "$lines" =~ ^[0-9]+$ ]] || return 1
+  ((lines > 0)) || return 1
+
+  from_line=$((lines - 200))
+  ((from_line < 1)) && from_line=1
+
+  out="$(session_stream_text "$session_id" "$from_line" 200 | tail -n 1 || true)"
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
 session_summary_text() {
   local session_id="$1"
   local file row id updated title cwd rollout_path archived lines last_ts activity
@@ -1966,7 +1988,7 @@ switch_session_ref() {
   local message_id="$1"
   local ref="$2"
   local requested_seconds="${3:-}"
-  local session_id title seconds
+  local session_id title seconds number label last_line body
 
   session_id="$(resolve_session_ref "$ref" || true)"
   if [[ -z "$session_id" ]]; then
@@ -1975,6 +1997,15 @@ switch_session_ref() {
   fi
 
   title="$(session_title "$session_id")"
+  number="$(session_alias_number "$session_id" || true)"
+  [[ -n "$number" ]] && label="#$number $title" || label="$title"
+  last_line="$(session_last_stream_line "$session_id" 2>/dev/null || true)"
+  if [[ -n "$last_line" ]]; then
+    last_line="$(printf '%s' "$last_line" | terminal_safe_fence_text)"
+    body="$(printf '%s\n\n```text\n%s\n```' "$label" "$last_line")"
+  else
+    body="$label"
+  fi
   if [[ -n "$requested_seconds" ]]; then
     seconds="$requested_seconds"
   else
@@ -1985,11 +2016,11 @@ switch_session_ref() {
   if [[ -d "$SYNC_LOCK_DIR" ]]; then
     [[ -n "$seconds" ]] || seconds=600
     update_sync_session "$session_id" "$seconds" || true
-    reply_notice "$message_id" "✅ 已常驻" "green" "$title" "同步流已切换。发送 停止同步 可结束同步。" "✅ 已常驻: $title"$'\n'"同步流已切换。"
+    reply_notice "$message_id" "✅ 已常驻" "green" "$body" "同步流已切换。发送 停止同步 可结束同步。" "✅ 已常驻: $label"$'\n'"同步流已切换。"
   elif [[ -n "$seconds" ]]; then
     start_sync "$message_id" "$seconds" "$session_id"
   else
-    reply_notice "$message_id" "✅ 已常驻" "green" "$title" "普通消息会进入这个会话；发送 清除会话 可取消。" "✅ 已常驻: $title"
+    reply_notice "$message_id" "✅ 已常驻" "green" "$body" "普通消息会进入这个会话；发送 清除会话 可取消。" "✅ 已常驻: $label"
   fi
 }
 

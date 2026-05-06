@@ -1838,7 +1838,7 @@ session_stream_text() {
 
 session_last_stream_line() {
   local session_id="$1"
-  local file lines from_line out
+  local file lines from_line stream out
 
   session_id="$(resolve_session_ref "$session_id" || true)"
   [[ -n "$session_id" ]] || return 1
@@ -1853,7 +1853,18 @@ session_last_stream_line() {
   from_line=$((lines - 200))
   ((from_line < 1)) && from_line=1
 
-  out="$(session_stream_text "$session_id" "$from_line" 200 | tail -n 1 || true)"
+  stream="$(session_stream_text "$session_id" "$from_line" 200 || true)"
+  [[ -n "$stream" ]] || return 1
+
+  # Prefer the last user/codex/done line; tool/exec lines are usually noise for a switch preview.
+  out="$(
+    printf '%s\n' "$stream" |
+      awk '
+        /user\\$ / || /codex> / || /done> / { last=$0 }
+        END { if (last != "") print last }
+      '
+  )"
+  [[ -n "$out" ]] || out="$(printf '%s\n' "$stream" | tail -n 1 || true)"
   [[ -n "$out" ]] || return 1
   printf '%s' "$out"
 }
@@ -2039,7 +2050,7 @@ current_session_text() {
 
 reply_current_session() {
   local message_id="$1"
-  local session_id title number label body detail
+  local session_id title number label body detail last_line
 
   session_id="$(active_session_id || true)"
   if [[ -z "$session_id" ]]; then
@@ -2052,7 +2063,13 @@ reply_current_session() {
   title="$(session_title "$session_id")"
   number="$(session_alias_number "$session_id" || true)"
   [[ -n "$number" ]] && label="#$number $title" || label="${title:-未命名}"
-  body="$label"
+  last_line="$(session_last_stream_line "$session_id" 2>/dev/null || true)"
+  if [[ -n "$last_line" ]]; then
+    last_line="$(printf '%s' "$last_line" | terminal_safe_fence_text)"
+    body="$(printf '%s\n\n```text\n%s\n```' "$label" "$last_line")"
+  else
+    body="$label"
+  fi
   detail=$(
     printf '**ID**：%s\n' "$session_id"
     printf '命令：清除会话 / 会话 %s / 同步会话 %s 10分钟\n' "${number:-$session_id}" "${number:-$session_id}"
@@ -2571,7 +2588,7 @@ start_sync() {
     if [[ "${CHAT_SYNC_RENDER:-stream}" == "screen" && "${CHAT_ENABLE_MESSAGE_UPDATE:-false}" == "true" ]]; then
       : # screen mode will post/update a single card; avoid extra chatter
     else
-      reply_notice "$message_id" "已开始同步" "blue" "$(session_title "$session_id")" "时长：${seconds}s\n命令：停止同步" "已开始同步（${seconds}s）。会话已常驻；发送 停止同步 可结束同步。"
+      reply_notice "$message_id" "已开始同步" "blue" "$(session_title "$session_id")" "同步持续：${seconds}s\n会话：常驻（直到 detach/切换）\n命令：停止同步" "已开始同步（${seconds}s）。会话已常驻（直到 detach/切换）。发送 停止同步 可结束同步。"
     fi
   fi
   sync_loop "$message_id" "$seconds" "$session_id" &

@@ -591,8 +591,8 @@ async function dispatchPrompt(ctx, messageId, prompt) {
   if (/^(deny|decline)\s+/.test(lower)) return approveByText(messageId, prompt, "deny");
   if (/^cancel\s+/.test(lower)) return approveByText(messageId, prompt, "cancel");
   if (/^answer\s+/.test(lower)) return answerByText(messageId, prompt);
-  if (/^(attach|switch|常驻|切换|切换会话)\s+/.test(prompt)) return attachThread(ctx, messageId, prompt);
-  if (/^(session|会话)\s+/.test(prompt)) return showThread(ctx, messageId, prompt);
+  if (/^(attach|switch|常驻|切换|切换会话)\s*\S+/.test(prompt)) return attachThread(ctx, messageId, prompt);
+  if (/^(session|会话)\s*\S+/.test(prompt)) return showThread(ctx, messageId, prompt);
   if (/^(new session|new chat|新会话|新对话)\s*$/i.test(prompt)) {
     ctx.newSessionPending = true;
     saveChatContext(ctx);
@@ -871,7 +871,8 @@ async function changeCwd(ctx, messageId, cwd) {
 }
 
 async function attachThread(ctx, messageId, prompt) {
-  const ref = prompt.replace(/^(attach|switch|常驻|切换|切换会话)\s+/i, "").trim().split(/\s+/)[0];
+  const match = prompt.match(/^(attach|switch|常驻|切换|切换会话)\s*(\S+)/i);
+  const ref = match?.[2] || "";
   const threadId = resolveThreadRef(ctx, ref);
   if (!threadId) {
     await replyCard(messageId, noticeCard("attach", "red", `unknown thread: ${ref}`, "send `sessions` first"));
@@ -886,7 +887,8 @@ async function attachThread(ctx, messageId, prompt) {
 }
 
 async function showThread(ctx, messageId, prompt) {
-  const ref = prompt.replace(/^(session|会话)\s+/i, "").trim().split(/\s+/)[0];
+  const match = prompt.match(/^(session|会话)\s*(\S+)/i);
+  const ref = match?.[2] || "";
   const threadId = resolveThreadRef(ctx, ref);
   if (!threadId) {
     await replyCard(messageId, noticeCard("session", "red", `unknown thread: ${ref}`, "send `sessions` first"));

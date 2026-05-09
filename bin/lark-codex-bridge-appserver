@@ -1079,11 +1079,25 @@ function approvalCard(approval, task) {
 
 function approvalElements(task, approvals = task?.approvals || []) {
   if (!approvals.length || config.approvalUi === "text") return [];
-  const actions = [];
-  for (const approval of approvals) {
-    actions.push(...approvalButtons(approval));
+  const buttons = [];
+  for (const approval of approvals) buttons.push(...approvalButtons(approval));
+  if (!buttons.length) return [];
+
+  const elements = [{ tag: "hr" }];
+  const rowSize = 4;
+  for (let i = 0; i < buttons.length; i += rowSize) {
+    const row = buttons.slice(i, i + rowSize);
+    elements.push({
+      tag: "column_set",
+      horizontal_spacing: "8px",
+      columns: row.map((btn) => ({
+        tag: "column",
+        width: "auto",
+        elements: [btn],
+      })),
+    });
   }
-  return [{ tag: "action", actions }];
+  return elements;
 }
 
 function approvalButtons(approval) {
@@ -1092,20 +1106,20 @@ function approvalButtons(approval) {
     const buttons = [];
     for (const question of questions) {
       for (const option of question.options || []) {
-        buttons.push(button(option.label, "primary", approvalValue(approval, "answer", option.label)));
+        buttons.push(button(option.label, "primary_filled", approvalValue(approval, "answer", option.label)));
       }
     }
-    buttons.push(button("Deny", "danger", approvalValue(approval, "deny")));
+    buttons.push(button("Deny", "danger_filled", approvalValue(approval, "deny")));
     return buttons.slice(0, 6);
   }
-  const buttons = [button("Allow once", "primary", approvalValue(approval, "allow"))];
+  const buttons = [button("Allow once", "primary_filled", approvalValue(approval, "allow"))];
   if (config.approvalAllowSession && !approval.method.includes("permissions")) {
     buttons.push(button("Allow session", "default", approvalValue(approval, "allow-session")));
   }
   if (approval.method.includes("permissions")) {
     buttons.push(button("Allow session", "default", approvalValue(approval, "allow-session")));
   }
-  buttons.push(button("Deny", "danger", approvalValue(approval, "deny")));
+  buttons.push(button("Deny", "danger_filled", approvalValue(approval, "deny")));
   buttons.push(button("Cancel", "default", approvalValue(approval, "cancel")));
   return buttons;
 }
@@ -1130,7 +1144,8 @@ function button(text, type, value) {
     tag: "button",
     text: { tag: "plain_text", content: text },
     type,
-    value,
+    size: "medium",
+    behaviors: [{ type: "callback", value }],
   };
 }
 

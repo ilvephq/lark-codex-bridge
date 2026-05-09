@@ -265,15 +265,22 @@ async function handleCodexNotification(msg) {
     return;
   }
 
-  if (
-    msg.method === "item/agentMessage/delta" ||
-    msg.method === "item/plan/delta" ||
-    msg.method === "item/reasoning/summaryTextDelta"
-  ) {
+  if (msg.method === "item/agentMessage/delta") {
     const task = taskForTurn(threadId, turnId);
     if (task && params.delta) {
-      appendTaskOutput(task, params.delta);
+      appendTaskOutput(task, params.delta, "main");
       await patchTaskCardThrottled(task, "RUNNING");
+    }
+    return;
+  }
+
+  // Keep plans/reasoning out of the main terminal stream (too noisy on mobile).
+  // We still capture them in debug output when enabled for the chat.
+  if (msg.method === "item/plan/delta" || msg.method === "item/reasoning/summaryTextDelta") {
+    const task = taskForTurn(threadId, turnId);
+    if (task && params.delta) {
+      const ctx = chatContext(task.chatId);
+      if (ctx.settings?.debug) appendTaskOutput(task, params.delta, "debug");
     }
     return;
   }
@@ -285,7 +292,8 @@ async function handleCodexNotification(msg) {
   ) {
     const task = taskForTurn(threadId, turnId);
     if (task && params.delta) {
-      appendTaskOutput(task, params.delta);
+      // Tool output is useful, but often noisy; keep it under collapsible details.
+      appendTaskOutput(task, params.delta, "debug");
       await patchTaskCardThrottled(task, "RUNNING");
     }
     return;
@@ -295,7 +303,7 @@ async function handleCodexNotification(msg) {
     const task = taskForTurn(threadId, turnId);
     if (task) {
       const changed = Array.isArray(params.changes) ? params.changes.length : 0;
-      appendTaskOutput(task, `\n[file changes: ${changed}]\n`);
+      appendTaskOutput(task, `\n[file changes: ${changed}]\n`, "debug");
       await patchTaskCardThrottled(task, "RUNNING");
     }
     return;
@@ -707,6 +715,7 @@ function makeTask(ctx, sourceMessageId, prompt, threadId) {
     turnId: "",
     state: "RUNNING",
     output: "",
+    debugOutput: "",
     approvals: [],
     startedAt: Date.now(),
     lastPatchAt: 0,
@@ -721,10 +730,15 @@ function taskForTurn(threadId, turnId) {
   return state.runningByThread.get(threadId);
 }
 
-function appendTaskOutput(task, delta) {
+function appendTaskOutput(task, delta, kind = "main") {
+  if (kind === "debug") {
+    task.debugOutput = truncateTail(`${task.debugOutput || ""}${delta}`, Math.min(config.outputLimit, 24000));
+    return;
+  }
   task.output = truncateTail(`${task.output}${delta}`, config.outputLimit);
   const ctx = chatContext(task.chatId);
-  ctx.lastReadableOutput = task.output.trim().split(/\r?\n/).filter(Boolean).slice(-1)[0] || ctx.lastReadableOutput || "";
+  ctx.lastReadableOutput =
+    task.output.trim().split(/\r?\n/).filter(Boolean).slice(-1)[0] || ctx.lastReadableOutput || "";
   saveChatContext(ctx);
 }
 
@@ -986,8 +1000,6 @@ async function lastReadableForThread(threadId) {
     for (const turn of thread.turns || []) {
       for (const item of turn.items || []) {
         if (item.type === "agentMessage" && item.text) lines.push(item.text);
-        if (item.type === "plan" && item.text) lines.push(item.text);
-        if (item.type === "commandExecution" && item.aggregatedOutput) lines.push(item.aggregatedOutput);
       }
     }
     return compact(lines.filter(Boolean).slice(-1)[0] || "", config.outputLimit);
@@ -1008,21 +1020,48 @@ function rememberThread(thread) {
   });
 }
 
+function approvalSummaryText(approval) {
+  const p = approval?.params || {};
+  const reason = (p.reason || "").trim();
+  const prefix = reason || "Approval required";
+  if (p.command) {
+    const cmd = Array.isArray(p.command) ? p.command.join(" ") : String(p.command);
+    return `${prefix}\n${compact(cmd, 1800)}`;
+  }
+  if (approval?.method?.includes("fileChange")) return `${prefix}\n(file changes)`;
+  if (approval?.method?.includes("permissions")) return `${prefix}\n(permissions)`;
+  if (approval?.method?.includes("requestUserInput")) return `${prefix}\n(user input)`;
+  return prefix;
+}
+
 function terminalCard(task, cardState, output) {
   const elapsed = Math.max(0, Math.floor((Date.now() - task.startedAt) / 1000));
+  let rendered = truncateTail(output || "working...", config.outputLimit);
+  if (cardState === "WAITING" && task.approvals?.length) {
+    const summary = approvalSummaryText(task.approvals[0]);
+    rendered = rendered ? `${rendered}\n\n${summary}` : summary;
+  }
   const body = [
     "```text",
-    truncateTail(output || "working...", config.outputLimit).replace(/```/g, "`\u200b``"),
+    rendered.replace(/```/g, "`\u200b``"),
     "```",
     "",
     `\`${cardState}\` elapsed ${elapsed}s | queue ${state.queue.length} | thread ${shortId(task.threadId)} | cwd ${shortPath(chatContext(task.chatId).settings.workdir)}`,
   ].join("\n");
-  const detail = [
+  const detailLines = [
     `task_id: ${task.id}`,
     `thread_id: ${task.threadId}`,
     task.turnId ? `turn_id: ${task.turnId}` : "",
     `prompt: ${compact(task.prompt, 500)}`,
-  ].filter(Boolean).join("\n");
+  ].filter(Boolean);
+  if (task.debugOutput) {
+    detailLines.push("");
+    detailLines.push("tool_output:");
+    detailLines.push("```text");
+    detailLines.push(truncateTail(task.debugOutput, 1800).replace(/```/g, "`\u200b``"));
+    detailLines.push("```");
+  }
+  const detail = detailLines.join("\n");
   return cardJson(`${cardState} Codex`, templateForState(cardState), body, detail, approvalElements(task));
 }
 

@@ -528,13 +528,11 @@ update_interactive_message() {
   local card_json="$2"
 
   refresh_tenant_token
-  # Prefer PATCH; fall back to PUT for older tenants/endpoints.
+  # PATCH is the supported "update message card" API. Avoid PUT: it maps to
+  # "edit message" and can reject interactive cards with invalid msg_type errors.
   lark-cli api patch "/im/v1/messages/$target_message_id" \
     --data "$(jq -n --arg msg_type "interactive" --arg content "$card_json" '{msg_type:$msg_type, content:$content}')" \
-    --as bot >/dev/null </dev/null ||
-    lark-cli api put "/im/v1/messages/$target_message_id" \
-      --data "$(jq -n --arg msg_type "interactive" --arg content "$card_json" '{msg_type:$msg_type, content:$content}')" \
-      --as bot >/dev/null </dev/null
+    --as bot >/dev/null </dev/null
 }
 
 add_reaction() {

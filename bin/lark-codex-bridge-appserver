@@ -1287,10 +1287,9 @@ async function replyCardCapture(messageId, card) {
 async function updateMessage(messageId, card) {
   if (!config.enableMessageUpdate && config.terminalRender !== "screen") return false;
   const body = { msg_type: "interactive", content: JSON.stringify(card) };
-  return Boolean(
-    (await larkApi("PATCH", `/im/v1/messages/${encodeURIComponent(messageId)}`, body)) ||
-      (await larkApi("PUT", `/im/v1/messages/${encodeURIComponent(messageId)}`, body))
-  );
+  // Updating card content is supported via PATCH (message card patch API).
+  // Avoid PUT: it maps to "edit message" and frequently rejects card msg_type.
+  return Boolean(await larkApi("PATCH", `/im/v1/messages/${encodeURIComponent(messageId)}`, body));
 }
 
 async function addReaction(messageId, emojiType = config.ackReactionEmoji) {

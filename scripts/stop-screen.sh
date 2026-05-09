@@ -21,7 +21,7 @@ if [[ -f "$BRIDGE_LOCK_PID_FILE" ]]; then
   read -r pid <"$BRIDGE_LOCK_PID_FILE" 2>/dev/null || true
   if [[ "$pid" =~ ^[0-9]+$ ]]; then
     cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    if [[ -n "$cmd" && "$cmd" == *"lark-codex-bridge/bin/lark-codex-bridge"* ]]; then
+    if [[ -n "$cmd" && ( "$cmd" == *"lark-codex-bridge/bin/lark-codex-bridge"* || "$cmd" == *"lark-codex-bridge/bin/lark-codex-bridge-appserver"* ) ]]; then
       if kill -0 "$pid" 2>/dev/null; then
         kill "$pid" 2>/dev/null || true
         sleep 1

@@ -2237,11 +2237,7 @@ switch_session_ref() {
   else
     body="$label"
   fi
-  if [[ -n "$requested_seconds" ]]; then
-    seconds="$requested_seconds"
-  else
-    seconds="$(sync_remaining_seconds || true)"
-  fi
+  seconds="$requested_seconds"
 
   set_active_session "$session_id"
   if [[ -d "$SYNC_LOCK_DIR" ]]; then
@@ -2252,9 +2248,10 @@ switch_session_ref() {
     reply_notice "$message_id" "✅ 已常驻" "green" "$body" "同步流已切换。发送 停止同步 可结束同步。" "✅ 已常驻: $label"$'\n'"同步流已切换。"
   elif [[ -n "$seconds" ]]; then
     start_sync "$message_id" "$seconds" "$session_id"
-  else
-    reply_notice "$message_id" "✅ 已常驻" "green" "$body" "普通消息会进入这个会话；发送 清除会话 可取消。" "✅ 已常驻: $label"
+    return
   fi
+
+  reply_notice "$message_id" "✅ 已常驻" "green" "$body" "普通消息会进入这个会话；发送 清除会话 可取消。" "✅ 已常驻: $label"
 }
 
 current_session_text() {

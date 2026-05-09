@@ -19,6 +19,7 @@ const state = {
   tasksByTurn: new Map(),
   pendingApprovals: new Map(),
   queue: [],
+  larkSubscriber: null,
 };
 
 if (process.argv.includes("--self-test")) {
@@ -132,6 +133,7 @@ function acquireBridgeLock() {
   }
   fs.writeFileSync(config.bridgeLockPidFile, String(process.pid));
   const cleanup = () => {
+    stopChildProcesses();
     try {
       fs.rmSync(config.bridgeLockDir, { recursive: true, force: true });
     } catch (_) {}
@@ -155,6 +157,19 @@ function isProcessAlive(pid) {
   } catch (_) {
     return false;
   }
+}
+
+function stopChildProcesses() {
+  try {
+    if (state.larkSubscriber && !state.larkSubscriber.killed) {
+      state.larkSubscriber.kill("SIGTERM");
+    }
+  } catch (_) {}
+  try {
+    if (state.codex?.child && !state.codex.child.killed) {
+      state.codex.child.kill("SIGTERM");
+    }
+  } catch (_) {}
 }
 
 class CodexAppServer {
@@ -451,9 +466,23 @@ function firstOption(question) {
 }
 
 function startLarkSubscriber() {
-  const args = ["event", "+subscribe", "--quiet"];
+  try {
+    if (state.larkSubscriber && !state.larkSubscriber.killed) {
+      state.larkSubscriber.kill("SIGTERM");
+    }
+  } catch (_) {}
+  const args = [
+    "event",
+    "+subscribe",
+    "--quiet",
+    // Avoid subscribing to every possible event type (which can spam stderr with
+    // SDK "not found handler" noise). We only need message input + card button callbacks.
+    "--event-types",
+    "im.message.receive_v1,card.action.trigger",
+  ];
   log(`lark subscribe ${args.join(" ")}`);
   const child = spawn("lark-cli", args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+  state.larkSubscriber = child;
   child.stderr.on("data", (chunk) => {
     const text = String(chunk).trim();
     if (text) log(`lark ${text}`);
@@ -465,6 +494,7 @@ function startLarkSubscriber() {
     });
   });
   child.on("exit", (code, signal) => {
+    if (state.larkSubscriber === child) state.larkSubscriber = null;
     log(`lark subscribe exited code=${code} signal=${signal || ""}; reconnecting`);
     setTimeout(startLarkSubscriber, 2000);
   });
@@ -1041,14 +1071,14 @@ function terminalCard(task, cardState, output) {
     const summary = approvalSummaryText(task.approvals[0]);
     rendered = rendered ? `${rendered}\n\n${summary}` : summary;
   }
-  const body = [
-    "```text",
-    rendered.replace(/```/g, "`\u200b``"),
-    "```",
-    "",
-    `\`${cardState}\` elapsed ${elapsed}s | queue ${state.queue.length} | thread ${shortId(task.threadId)} | cwd ${shortPath(chatContext(task.chatId).settings.workdir)}`,
-  ].join("\n");
+  // Keep the main view focused on readable output. Status/meta goes into the
+  // collapsible detail panel instead of polluting the "terminal" stream.
+  const body = ["```text", rendered.replace(/```/g, "`\u200b``"), "```"].join("\n");
   const detailLines = [
+    `state: ${cardState}`,
+    `elapsed: ${elapsed}s`,
+    `queue: ${state.queue.length}`,
+    `cwd: ${shortPath(chatContext(task.chatId).settings.workdir)}`,
     `task_id: ${task.id}`,
     `thread_id: ${task.threadId}`,
     task.turnId ? `turn_id: ${task.turnId}` : "",

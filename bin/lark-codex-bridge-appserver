@@ -20,6 +20,7 @@ const state = {
   pendingApprovals: new Map(),
   queue: [],
   larkSubscriber: null,
+  lastSubscribeLockReclaimAt: 0,
 };
 
 if (process.argv.includes("--self-test")) {
@@ -42,7 +43,9 @@ async function main() {
   log("backend=app-server ready");
 
   startQueueLoop();
-  startLarkSubscriber();
+  startLarkSubscriber().catch((error) => {
+    log(`lark-subscriber-start-error ${error.stack || error.message || error}`);
+  });
 }
 
 function loadEnv() {
@@ -82,6 +85,11 @@ function buildConfig(source) {
   const stateDir = expandHome(source.LARK_CODEX_STATE_DIR || path.join(baseDir, "state"));
   const approvalUi = oneOf(source.LARK_CODEX_APPROVAL_UI || "buttons", ["buttons", "text", "both"], "buttons");
   const backendListen = source.LARK_CODEX_APP_SERVER_LISTEN || "stdio://";
+  const subscribeLockPolicy = oneOf(
+    source.LARK_CODEX_SUBSCRIBE_LOCK_POLICY || "reclaim",
+    ["reclaim", "error", "ignore"],
+    "reclaim",
+  );
   return {
     baseDir,
     stateDir,
@@ -106,7 +114,106 @@ function buildConfig(source) {
     ackEmoji: source.LARK_CODEX_ACK_EMOJI || "👀",
     ackReactionEmoji: source.LARK_CODEX_ACK_REACTION_EMOJI || "OK",
     listen: backendListen,
+    subscribeLockPolicy,
   };
+}
+
+function subscribeLockFile() {
+  if (!config.appId) return "";
+  return path.join(os.homedir(), ".lark-cli", "locks", `subscribe_${config.appId}.lock`);
+}
+
+function runCapture(cmd, args, opts = {}) {
+  const { timeoutMs = 3000 } = opts;
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch (_) {}
+      reject(new Error(`${cmd} timed out`));
+    }, timeoutMs);
+    child.stdout.on("data", (c) => {
+      stdout += String(c);
+    });
+    child.stderr.on("data", (c) => {
+      stderr += String(c);
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      // lsof returns exit code 1 when nothing matched; treat that as empty output.
+      if (code === 0 || (cmd === "lsof" && code === 1)) return resolve({ stdout, stderr, code });
+      const msg = stderr.trim() || stdout.trim() || `${cmd} exited code=${code}`;
+      reject(new Error(msg));
+    });
+  });
+}
+
+async function reclaimSubscribeLock(reason) {
+  if (config.subscribeLockPolicy !== "reclaim") return false;
+  const lockFile = subscribeLockFile();
+  if (!lockFile || !fs.existsSync(lockFile)) return false;
+
+  const now = Date.now();
+  // Avoid kill loops if `lark-cli` is flapping for some other reason.
+  if (now - state.lastSubscribeLockReclaimAt < 60_000) return false;
+  state.lastSubscribeLockReclaimAt = now;
+
+  // Find who is holding the lock. If `lsof` isn't available, we can't safely reclaim.
+  try {
+    await runCapture("lsof", ["-t", lockFile], { timeoutMs: 2000 });
+  } catch (error) {
+    log(`subscribe-lock reclaim skipped (${reason}): lsof failed: ${error.message || error}`);
+    return false;
+  }
+
+  let pidsText = "";
+  try {
+    const out = await runCapture("lsof", ["-t", lockFile], { timeoutMs: 2000 });
+    pidsText = out.stdout || "";
+  } catch (_) {
+    pidsText = "";
+  }
+  const pids = pidsText
+    .trim()
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter((s) => /^[0-9]+$/.test(s));
+  if (pids.length === 0) {
+    // Stale file with no holder.
+    try {
+      fs.rmSync(lockFile, { force: true });
+      log(`subscribe-lock reclaimed (${reason}): removed stale lock file`);
+      return true;
+    } catch (error) {
+      log(`subscribe-lock reclaim failed (${reason}): ${error.message || error}`);
+      return false;
+    }
+  }
+
+  log(`subscribe-lock reclaimed (${reason}): stopping stale lark-cli pid(s)=${pids.join(",")}`);
+  for (const pid of pids) {
+    try {
+      process.kill(Number(pid), "SIGTERM");
+    } catch (_) {}
+  }
+  await new Promise((r) => setTimeout(r, 800));
+  for (const pid of pids) {
+    try {
+      process.kill(Number(pid), 0);
+      process.kill(Number(pid), "SIGKILL");
+    } catch (_) {}
+  }
+  try {
+    fs.rmSync(lockFile, { force: true });
+  } catch (_) {}
+  return true;
 }
 
 function assertConfig() {
@@ -465,12 +572,16 @@ function firstOption(question) {
   return question.options[0]?.label || "";
 }
 
-function startLarkSubscriber() {
+async function startLarkSubscriber() {
   try {
     if (state.larkSubscriber && !state.larkSubscriber.killed) {
       state.larkSubscriber.kill("SIGTERM");
     }
   } catch (_) {}
+  if (config.subscribeLockPolicy === "reclaim") {
+    // Best-effort cleanup so we don't get stuck in a noisy reconnect loop.
+    await reclaimSubscribeLock("startup");
+  }
   const args = [
     "event",
     "+subscribe",
@@ -483,9 +594,15 @@ function startLarkSubscriber() {
   log(`lark subscribe ${args.join(" ")}`);
   const child = spawn("lark-cli", args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
   state.larkSubscriber = child;
+  let sawSubscribeLockError = false;
   child.stderr.on("data", (chunk) => {
     const text = String(chunk).trim();
-    if (text) log(`lark ${text}`);
+    if (text) {
+      if (text.includes("another event +subscribe instance is already running")) {
+        sawSubscribeLockError = true;
+      }
+      log(`lark ${text}`);
+    }
   });
   const rl = readline.createInterface({ input: child.stdout });
   rl.on("line", (line) => {
@@ -496,7 +613,21 @@ function startLarkSubscriber() {
   child.on("exit", (code, signal) => {
     if (state.larkSubscriber === child) state.larkSubscriber = null;
     log(`lark subscribe exited code=${code} signal=${signal || ""}; reconnecting`);
-    setTimeout(startLarkSubscriber, 2000);
+    if (code === 2 && sawSubscribeLockError && config.subscribeLockPolicy === "reclaim") {
+      reclaimSubscribeLock("subscribe-lock").finally(() => {
+        setTimeout(() => {
+          startLarkSubscriber().catch((error) => {
+            log(`lark-subscriber-start-error ${error.stack || error.message || error}`);
+          });
+        }, 1000);
+      });
+      return;
+    }
+    setTimeout(() => {
+      startLarkSubscriber().catch((error) => {
+        log(`lark-subscriber-start-error ${error.stack || error.message || error}`);
+      });
+    }, 2000);
   });
 }
 

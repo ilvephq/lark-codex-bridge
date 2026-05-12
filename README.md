@@ -280,6 +280,10 @@ LARK_CODEX_DIRECTORY_FORMAT=card
 LARK_CODEX_OUTPUT_STYLE=compact
 LARK_CODEX_DIRECTORY_LIMIT=12
 LARK_CODEX_CARD_SCHEMA=2
+LARK_CODEX_CARD_MOBILE_LAYOUT=true
+LARK_CODEX_CARD_BODY_LIMIT_CHARS=4000
+LARK_CODEX_CARD_DETAIL_LIMIT_CHARS=2000
+LARK_CODEX_CARD_MOBILE_LINE_CHARS=88
 LARK_CODEX_BACKEND=auto
 LARK_CODEX_APP_SERVER_LISTEN=stdio://
 LARK_CODEX_APPROVAL_UI=buttons
@@ -303,6 +307,8 @@ LARK_CODEX_DANGEROUS_BYPASS=false
 `LARK_CODEX_TERMINAL_RENDER=screen` 表示任务进度优先更新同一张 running card；如果缺少 `im:message:update` 权限，会自动降级为逐条卡片或纯文本 fallback。
 
 `LARK_CODEX_IDLE_STATUS_PATCH_SECONDS=60` 表示长时间无新输出时最多每 60 秒更新同一张卡片状态行；设为 `0` 可禁用空闲状态更新。
+
+`LARK_CODEX_CARD_MOBILE_LAYOUT=true` 是默认值：卡片按手机阅读优先，关闭宽屏模式，主输出限长，长行会自动换行，状态/路径/thread 等元信息放进折叠详情。审批按钮在移动端每行最多 2 个。
 
 `LARK_CODEX_BACKEND=auto` 会优先尝试 Codex `app-server`，不可用时回退旧 `exec` 后端。`app-server` 后端让飞书消息进入 Codex thread，并把 approval request 显示为飞书卡片按钮。
 
@@ -432,31 +438,35 @@ Stop:
 
 Send these to your Feishu/Lark bot:
 
-- `status`: show bridge status.
-- `目录` or `sessions`: list Codex sessions.
-- `attach 1` / `切换 1` / `常驻 1`: set session `1` as the persistent current session.
-- `当前会话` or `current`: show the current target session.
-- `清除会话` or `detach`: clear the current target session.
-- `新任务 <content>` or `new <content>`: force a new Codex task instead of using the current session.
-- `新会话 <content>` / `new session <content>`: create a new Codex session and make it the persistent current session.
-- `新会话` / `new session`: make the next normal message create and attach a new session.
-- `长任务 <content>` / `long <content>`: run an extended-timeout job.
-- `任务` / `task`: show the latest long job.
-- `tasks` / `jobs`: list recent jobs.
-- `继续任务` / `continue` / `continue task`: resume the latest failed or paused job. If no long-job record exists but a session is attached, it upgrades the continuation into a long job.
-- `会话 1`: show recent progress for session `1`.
-- `同步会话 1 10分钟`: stream session `1` for 10 minutes (only pushes when new events; no periodic keepalive).
-- `切换 2`: switch the attached stream to session `2`.
-- `停止同步`: stop streaming.
-- `cd /path` / `cwd /path`: set the default workdir for new tasks in this chat.
-- `pwd`: show the default workdir for new tasks in this chat.
-- `debug on|off`: control how verbose the folded details panel is.
-- `syncmode stream|screen`: choose sync render mode.
-- `update on|off`: enable/disable message update (required for `screen`).
-- `队列`: show queued messages.
-- `logs`: show recent task logs.
-- `approve <id>` / `approve session <id>` / `deny <id>` / `cancel <id>`: text fallback for Codex approval requests.
-- `answer <id> <text>`: text fallback for Codex user-input requests.
+Default command mode is `slash`: system commands must start with `/`; plain messages go to the current Codex thread/session.
+
+- `/status`: show bridge status.
+- `/目录` or `/sessions`: list Codex sessions.
+- `/attach 1` / `/切换 1` / `/常驻 1`: set session `1` as the persistent current session.
+- `/当前会话` or `/current`: show the current target session.
+- `/清除会话` or `/detach`: clear the current target session.
+- `/新任务 <content>` or `/new <content>`: force a new Codex task instead of using the current session.
+- `/新会话 <content>` / `/new session <content>`: create a new Codex session and make it the persistent current session.
+- `/新会话` / `/new session`: make the next normal message create and attach a new session.
+- `/长任务 <content>` / `/long <content>`: run an extended-timeout job.
+- `/任务` / `/task`: show the latest long job.
+- `/tasks` / `/jobs`: list recent jobs.
+- `/继续任务` / `/continue` / `/continue task`: resume the latest failed or paused job.
+- `/会话 1`: show recent progress for session `1`.
+- `/同步会话 1 10分钟`: stream session `1` for 10 minutes.
+- `/切换 2`: switch the attached stream to session `2`.
+- `/停止同步`: stop streaming.
+- `/cd /path` / `/cwd /path`: set the default workdir for new tasks in this chat.
+- `/pwd`: show the default workdir for new tasks in this chat.
+- `/debug on|off`: control folded details verbosity.
+- `/syncmode stream|screen`: choose sync render mode.
+- `/update on|off`: enable/disable message update.
+- `/队列`: show queued messages.
+- `/logs`: show recent task logs.
+- `/approve <id>` / `/approve session <id>` / `/deny <id>` / `/cancel <id>`: text fallback for Codex approval requests.
+- `/answer <id> <text>`: text fallback for Codex user-input requests.
+
+Cards are mobile-first by default (`LARK_CODEX_CARD_MOBILE_LAYOUT=true`): wide-screen mode is disabled, main output is capped, long lines wrap, metadata stays folded, and approval buttons are grouped in small rows.
 
 ## Dangerous Mode
 

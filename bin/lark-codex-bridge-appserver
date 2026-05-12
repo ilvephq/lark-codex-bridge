@@ -82,6 +82,8 @@ function buildConfig(source) {
   const approvalUi = oneOf(source.LARK_CODEX_APPROVAL_UI || "buttons", ["buttons", "text", "both"], "buttons");
   const backendListen = source.LARK_CODEX_APP_SERVER_LISTEN || "stdio://";
   const commandMode = oneOf(source.LARK_CODEX_COMMAND_MODE || "slash", ["slash", "both", "legacy"], "slash");
+  const mobileLayout = stringBool(source.LARK_CODEX_CARD_MOBILE_LAYOUT, true);
+  const outputLimit = intValue(source.LARK_CODEX_OUTPUT_LIMIT_CHARS || source.LARK_CODEX_MAX_REPLY_CHARS, 12000);
   const subscribeLockPolicy = oneOf(
     source.LARK_CODEX_SUBSCRIBE_LOCK_POLICY || "reclaim",
     ["reclaim", "error", "ignore"],
@@ -100,7 +102,14 @@ function buildConfig(source) {
     codexBin: source.LARK_CODEX_BIN || "codex",
     model: source.LARK_CODEX_MODEL || "gpt-5.2",
     defaultWorkdir: expandHome(source.LARK_CODEX_WORKDIR || os.homedir()),
-    outputLimit: intValue(source.LARK_CODEX_OUTPUT_LIMIT_CHARS || source.LARK_CODEX_MAX_REPLY_CHARS, 12000),
+    outputLimit,
+    cardBodyLimit: intValue(
+      source.LARK_CODEX_CARD_BODY_LIMIT_CHARS,
+      mobileLayout ? Math.min(outputLimit, 4000) : outputLimit,
+    ),
+    cardDetailLimit: intValue(source.LARK_CODEX_CARD_DETAIL_LIMIT_CHARS, mobileLayout ? 2000 : 4000),
+    mobileLineChars: intValue(source.LARK_CODEX_CARD_MOBILE_LINE_CHARS, 88),
+    mobileLayout,
     approvalUi,
     approvalTimeoutSeconds: intValue(source.LARK_CODEX_APPROVAL_TIMEOUT_SECONDS, 600),
     approvalAllowSession: stringBool(source.LARK_CODEX_APPROVAL_ALLOW_SESSION, true),
@@ -1290,9 +1299,9 @@ function approvalSummaryText(approval) {
 
 function terminalCard(task, cardState, output) {
   const elapsed = Math.max(0, Math.floor((Date.now() - task.startedAt) / 1000));
-  let rendered = truncateTail(output || "working...", config.outputLimit);
+  let rendered = mobileCodeText(truncateTail(output || "working...", Math.max(500, config.cardBodyLimit - 80)));
   if (cardState === "WAITING" && task.approvals?.length) {
-    const summary = approvalSummaryText(task.approvals[0]);
+    const summary = mobileCodeText(approvalSummaryText(task.approvals[0]));
     rendered = rendered ? `${rendered}\n\n${summary}` : summary;
   }
   // Keep the main view focused on readable output. Status/meta goes into the
@@ -1338,7 +1347,7 @@ function approvalElements(task, approvals = task?.approvals || []) {
   if (!buttons.length) return [];
 
   const elements = [{ tag: "hr" }];
-  const rowSize = 4;
+  const rowSize = config.mobileLayout ? 2 : 4;
   for (let i = 0; i < buttons.length; i += rowSize) {
     const row = buttons.slice(i, i + rowSize);
     elements.push({
@@ -1398,7 +1407,7 @@ function button(text, type, value) {
     tag: "button",
     text: { tag: "plain_text", content: text },
     type,
-    size: "medium",
+    size: config.mobileLayout ? "small" : "medium",
     behaviors: [{ type: "callback", value }],
   };
 }
@@ -1407,7 +1416,7 @@ function approvalBody(approval) {
   const p = approval.params || {};
   if (approval.method.includes("command") || approval.method === "execCommandApproval") {
     const cmd = p.command ? (Array.isArray(p.command) ? p.command.join(" ") : p.command) : "command approval requested";
-    return `Approval required:\n\n\`\`\`text\n${compact(cmd, 1800)}\n\`\`\``;
+    return `Approval required:\n\n\`\`\`text\n${mobileCodeText(compact(cmd, 1800))}\n\`\`\``;
   }
   if (approval.method.includes("fileChange") || approval.method === "applyPatchApproval") {
     return `File change approval required.\n\n${p.reason || p.grantRoot || "Review the requested write before allowing."}`;
@@ -1427,7 +1436,7 @@ function noticeCard(title, template, body, detail) {
 }
 
 function cardJson(title, template, body, detail, extraElements = []) {
-  const elements = [{ tag: "markdown", content: truncateTail(body, config.outputLimit) }];
+  const elements = [{ tag: "markdown", content: truncateTail(body, config.cardBodyLimit) }];
   if (extraElements.length) elements.push(...extraElements);
   if (detail) {
     elements.push({
@@ -1440,12 +1449,12 @@ function cardJson(title, template, body, detail, extraElements = []) {
         icon_position: "right",
         icon_expanded_angle: -180,
       },
-      elements: [{ tag: "markdown", content: truncateTail(detail, 4000) }],
+      elements: [{ tag: "markdown", content: truncateTail(detail, config.cardDetailLimit) }],
     });
   }
   return {
     schema: "2.0",
-    config: { wide_screen_mode: true, enable_forward: false, update_multi: true },
+    config: { wide_screen_mode: !config.mobileLayout, enable_forward: false, update_multi: true },
     header: { template, title: { tag: "plain_text", content: title } },
     body: { elements },
   };
@@ -1629,6 +1638,21 @@ function truncateTail(text, max) {
   const value = String(text || "");
   if (value.length <= max) return value;
   return `[output truncated]\n${value.slice(value.length - max)}`;
+}
+
+function mobileCodeText(text) {
+  const value = String(text || "").replace(/```/g, "`\u200b``");
+  if (!config.mobileLayout) return value;
+  const width = Math.max(40, config.mobileLineChars || 88);
+  return value
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      if (line.length <= width) return [line];
+      const chunks = [];
+      for (let i = 0; i < line.length; i += width) chunks.push(line.slice(i, i + width));
+      return chunks;
+    })
+    .join("\n");
 }
 
 function stringifyCompact(value) {

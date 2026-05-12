@@ -6,6 +6,7 @@ BASE_DIR="${LARK_CODEX_BASE_DIR:-$HOME/.lark-codex}"
 CRED_FILE="${LARK_CODEX_CREDENTIALS:-$BASE_DIR/.env}"
 CODEX_WORKDIR="${LARK_CODEX_WORKDIR:-$HOME}"
 COMMAND_PREFIX="${LARK_CODEX_COMMAND_PREFIX:-/codex}"
+COMMAND_MODE="${LARK_CODEX_COMMAND_MODE:-slash}"
 ALLOWED_SENDER="${LARK_CODEX_ALLOWED_SENDER:-}"
 MAX_REPLY_CHARS="${LARK_CODEX_MAX_REPLY_CHARS:-12000}"
 OUTPUT_LIMIT_CHARS_DEFAULT="${LARK_CODEX_OUTPUT_LIMIT_CHARS:-$MAX_REPLY_CHARS}"
@@ -81,6 +82,10 @@ case "$TASK_MODE" in
   auto-long|explicit-long) ;;
   *) TASK_MODE="auto-long" ;;
 esac
+case "$COMMAND_MODE" in
+  slash|both|legacy) ;;
+  *) COMMAND_MODE="slash" ;;
+esac
 case "$TERMINAL_RENDER" in
   screen|stream) ;;
   *) TERMINAL_RENDER="screen" ;;
@@ -117,6 +122,7 @@ source "$CRED_FILE"
 # `config.example.env` actually take effect.
 CODEX_WORKDIR="${LARK_CODEX_WORKDIR:-$CODEX_WORKDIR}"
 COMMAND_PREFIX="${LARK_CODEX_COMMAND_PREFIX:-$COMMAND_PREFIX}"
+COMMAND_MODE="${LARK_CODEX_COMMAND_MODE:-$COMMAND_MODE}"
 ALLOWED_SENDER="${LARK_CODEX_ALLOWED_SENDER:-$ALLOWED_SENDER}"
 MAX_REPLY_CHARS="${LARK_CODEX_MAX_REPLY_CHARS:-$MAX_REPLY_CHARS}"
 OUTPUT_LIMIT_CHARS_DEFAULT="${LARK_CODEX_OUTPUT_LIMIT_CHARS:-$MAX_REPLY_CHARS}"
@@ -168,6 +174,10 @@ fi
 case "$TASK_MODE" in
   auto-long|explicit-long) ;;
   *) TASK_MODE="auto-long" ;;
+esac
+case "$COMMAND_MODE" in
+  slash|both|legacy) ;;
+  *) COMMAND_MODE="slash" ;;
 esac
 case "$TERMINAL_RENDER" in
   screen|stream) ;;
@@ -473,6 +483,45 @@ normalize_prompt() {
 
   prompt="$(printf '%s' "$prompt" | trim_ws)"
   printf '%s' "$prompt"
+}
+
+slash_command_line() {
+  local prompt="$1"
+  local raw first lower_first verb ref rest
+
+  [[ "$prompt" == /* ]] || return 1
+  raw="${prompt#/}"
+  raw="$(printf '%s' "$raw" | trim_ws)"
+  [[ -n "$raw" ]] || { printf '%s' "help"; return 0; }
+
+  # Support compact forms like "/切换2" or "/attach1 10分钟".
+  if [[ "$raw" =~ ^(切换|常驻|attach|switch)[[:space:]]*([0-9]+)(.*)$ ]]; then
+    verb="${BASH_REMATCH[1]}"
+    ref="${BASH_REMATCH[2]}"
+    rest="$(printf '%s' "${BASH_REMATCH[3]}" | trim_ws)"
+    if [[ -n "$rest" ]]; then
+      printf '%s' "$verb $ref $rest"
+    else
+      printf '%s' "$verb $ref"
+    fi
+    return 0
+  fi
+
+  first="${raw%%[[:space:]]*}"
+  lower_first="$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')"
+  case "$first" in
+    help|帮助|status|状态|logs|日志|queue|队列|目录|会话目录|sessions|"session list"|current|当前会话|detach|清除会话|取消会话|pwd|cd|cwd|debug|syncmode|同步模式|update|更新|tasks|jobs|任务|task|job|continue|resume|继续任务|长任务|long|新会话|新对话|new|新任务|会话|session|置顶|pin|取消置顶|unpin|停止同步|sync|同步|同步会话)
+      printf '%s' "$raw"
+      return 0
+      ;;
+    attach|switch)
+      # Lowercase-only commands; accept "/Attach" as well.
+      printf '%s' "$lower_first${raw#"$first"}"
+      return 0
+      ;;
+  esac
+
+  return 1
 }
 
 reply_text() {
@@ -3172,75 +3221,94 @@ while true; do
   prompt="$(normalize_prompt "$prompt")"
   ack_message "$message_id" || true
 
+  raw_prompt="$prompt"
+  slash_prompt=""
+  has_slash_cmd="false"
+  handle_commands="true"
+  if slash_prompt="$(slash_command_line "$prompt" 2>/dev/null)"; then
+    prompt="$slash_prompt"
+    has_slash_cmd="true"
+  fi
+  if [[ "$COMMAND_MODE" == "slash" && "$has_slash_cmd" != "true" ]]; then
+    handle_commands="false"
+    prompt="$raw_prompt"
+  fi
+
   if [[ -z "$prompt" ]]; then
     reply "$message_id" "收到。直接发送要我处理的内容即可。发送 目录 查看会话编号，help 查看命令。"
     continue
   fi
 
-  case "$prompt" in
-    status|状态)
-      reply_status "$message_id"
-      continue
-      ;;
-    logs|日志)
-      reply_notice "$message_id" "Logs" "blue" "$(logs_text)" "命令：status / 目录 / 队列" "$(logs_text)"
-      continue
-      ;;
-    queue|队列)
-      reply_notice "$message_id" "Queue" "blue" "$(queue_text)" "命令：status / logs" "$(queue_text)"
-      continue
-      ;;
-    help|帮助)
-      reply_notice "$message_id" "terminal help" "blue" "sessions\ncurrent\nattach 1\ndetach\nnew <prompt>\nnew session <prompt>\ncontinue\ntask / tasks\nqueue\nlogs\npwd\ncd /path\n\n普通消息默认进入当前会话；没有当前会话时创建新 terminal task。" "中文命令仍兼容：目录 / 切换 N / 清除会话 / 新会话 / 继续任务 / 队列" "sessions / current / attach 1 / detach / new <prompt> / continue / task / queue / logs / pwd / cd"
-      continue
-      ;;
-    目录|会话目录|sessions|"session list")
-      reply_directory "$message_id"
-      continue
-      ;;
-  esac
+  if [[ "$handle_commands" == "true" ]]; then
+    case "$prompt" in
+      status|状态)
+        reply_status "$message_id"
+        continue
+        ;;
+      logs|日志)
+        reply_notice "$message_id" "Logs" "blue" "$(logs_text)" "命令：status / 目录 / 队列" "$(logs_text)"
+        continue
+        ;;
+      queue|队列)
+        reply_notice "$message_id" "Queue" "blue" "$(queue_text)" "命令：status / logs" "$(queue_text)"
+        continue
+        ;;
+      help|帮助)
+        if [[ "$COMMAND_MODE" == "slash" ]]; then
+          reply_notice "$message_id" "terminal help" "blue" "/sessions\n/current\n/attach 1\n/detach\n/new <prompt>\n/new session <prompt>\n/continue\n/task / /tasks\n/queue\n/logs\n/pwd\n/cd /path\n\n普通消息默认进入当前会话；没有当前会话时创建新 terminal task。" "中文命令仍兼容：/目录 / /切换 N / /清除会话 / /新会话 / /继续任务 / /队列" "/sessions / /current / /attach 1 / /detach / /new <prompt> / /continue / /task / /queue / /logs / /pwd / /cd"
+        else
+          reply_notice "$message_id" "terminal help" "blue" "sessions\ncurrent\nattach 1\ndetach\nnew <prompt>\nnew session <prompt>\ncontinue\ntask / tasks\nqueue\nlogs\npwd\ncd /path\n\n普通消息默认进入当前会话；没有当前会话时创建新 terminal task。" "中文命令仍兼容：目录 / 切换 N / 清除会话 / 新会话 / 继续任务 / 队列" "sessions / current / attach 1 / detach / new <prompt> / continue / task / queue / logs / pwd / cd"
+        fi
+        continue
+        ;;
+      目录|会话目录|sessions|"session list")
+        reply_directory "$message_id"
+        continue
+        ;;
+    esac
+  fi
 
-  if [[ "$prompt" =~ ^(logs|日志)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(logs|日志)[[:space:]]+(.+)$ ]]; then
     reply_notice "$message_id" "Logs" "blue" "$(logs_text_for_job_ref "${BASH_REMATCH[2]}")" "命令：task <job_id> / tasks / logs" "$(logs_text_for_job_ref "${BASH_REMATCH[2]}")"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(当前会话|current)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(当前会话|current)$ ]]; then
     reply_current_session "$message_id"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(清除会话|取消会话|detach)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(清除会话|取消会话|detach)$ ]]; then
     detach_active_session "$message_id"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(pwd)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(pwd)$ ]]; then
     reply_pwd "$message_id"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(cd|cwd)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(cd|cwd)[[:space:]]+(.+)$ ]]; then
     cmd_cd "$message_id" "${BASH_REMATCH[2]}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^debug([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^debug([[:space:]]+(.+))?$ ]]; then
     cmd_debug "$message_id" "${BASH_REMATCH[2]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(syncmode|同步模式)[[:space:]]+([^[:space:]]+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(syncmode|同步模式)[[:space:]]+([^[:space:]]+)$ ]]; then
     cmd_syncmode "$message_id" "${BASH_REMATCH[2]}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(update|更新)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(update|更新)([[:space:]]+(.+))?$ ]]; then
     cmd_update_mode "$message_id" "${BASH_REMATCH[3]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(tasks|jobs)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(tasks|jobs)([[:space:]]+(.+))?$ ]]; then
     if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
       reply_job_status "$message_id" "${BASH_REMATCH[3]}"
     else
@@ -3249,61 +3317,61 @@ while true; do
     continue
   fi
 
-  if [[ "$prompt" =~ ^(任务|task|job)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(任务|task|job)([[:space:]]+(.+))?$ ]]; then
     reply_job_status "$message_id" "${BASH_REMATCH[3]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(继续任务|继续做任务|继续长任务|continue[[:space:]]+task|resume[[:space:]]+task|continue|resume)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(继续任务|继续做任务|继续长任务|continue[[:space:]]+task|resume[[:space:]]+task|continue|resume)([[:space:]]+(.+))?$ ]]; then
     continue_long_task "$message_id" "${BASH_REMATCH[3]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(长任务|long[[:space:]]+task|long)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(长任务|long[[:space:]]+task|long)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     start_long_task "$message_id" "$prompt"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(新会话|新对话|new[[:space:]]+session|new[[:space:]]+chat)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(新会话|新对话|new[[:space:]]+session|new[[:space:]]+chat)$ ]]; then
     set_new_session_pending
     reply_notice "$message_id" "新会话" "blue" "已准备创建新会话。下一条普通消息会创建并常驻到这个新会话。" "命令：清除会话 可取消当前常驻；切换 N 可切到已有会话。" "已准备创建新会话。下一条普通消息会创建并常驻到这个新会话。"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(新会话|新对话)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(新会话|新对话)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     start_new_session_task "$message_id" "$prompt"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(new[[:space:]]+session|new[[:space:]]+chat)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(new[[:space:]]+session|new[[:space:]]+chat)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     start_new_session_task "$message_id" "$prompt"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(会话|session)[[:space:]]+([^[:space:]]+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(会话|session)[[:space:]]+([^[:space:]]+)$ ]]; then
     reply_notice "$message_id" "会话进度" "blue" "$(session_summary_text "${BASH_REMATCH[2]}")" "命令：切换 N / sync session N [10分钟]" "$(session_summary_text "${BASH_REMATCH[2]}")"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(置顶|pin)[[:space:]]+([^[:space:]]+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(置顶|pin)[[:space:]]+([^[:space:]]+)$ ]]; then
     pin_session_ref "$message_id" "${BASH_REMATCH[2]}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(取消置顶|unpin)[[:space:]]+([^[:space:]]+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(取消置顶|unpin)[[:space:]]+([^[:space:]]+)$ ]]; then
     unpin_session_ref "$message_id" "${BASH_REMATCH[2]}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(停止同步|stop[[:space:]]+sync|sync[[:space:]]+stop)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(停止同步|stop[[:space:]]+sync|sync[[:space:]]+stop)$ ]]; then
     stop_sync "$message_id"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(切换会话|切换到|切换|switch|attach|常驻会话|常驻|stick|persist)[[:space:]]*([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(切换会话|切换到|切换|switch|attach|常驻会话|常驻|stick|persist)[[:space:]]*([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
     session_ref="${BASH_REMATCH[2]}"
     duration_text="${BASH_REMATCH[4]:-}"
     if [[ -n "$duration_text" ]]; then
@@ -3319,7 +3387,7 @@ while true; do
     continue
   fi
 
-  if [[ "$prompt" =~ ^(同步会话|sync[[:space:]]+session)[[:space:]]+([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(同步会话|sync[[:space:]]+session)[[:space:]]+([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
     session_ref="${BASH_REMATCH[2]}"
     duration_text="${BASH_REMATCH[4]:-}"
     session_id="$(resolve_session_ref "$session_ref" || true)"
@@ -3336,7 +3404,7 @@ while true; do
     continue
   fi
 
-  if [[ "$prompt" =~ ^同步[[:space:]]+([^[:space:]]+)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^同步[[:space:]]+([^[:space:]]+)[[:space:]]+(.+)$ ]]; then
     session_ref="${BASH_REMATCH[1]}"
     duration_text="${BASH_REMATCH[2]}"
     session_id="$(resolve_session_ref "$session_ref" || true)"
@@ -3351,12 +3419,12 @@ while true; do
     fi
   fi
 
-  if sync_seconds="$(parse_sync_seconds "$prompt")"; then
+  if [[ "$handle_commands" == "true" ]] && sync_seconds="$(parse_sync_seconds "$prompt")"; then
     start_sync "$message_id" "$sync_seconds"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(新任务|new)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(新任务|new)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     clear_new_session_pending
     if [[ "$TASK_MODE" == "auto-long" ]]; then

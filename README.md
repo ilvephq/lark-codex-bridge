@@ -92,30 +92,55 @@ tail -f ~/.lark-codex/bridge.log
 ./scripts/stop-screen.sh
 ```
 
+## 开机自运行（LaunchAgent）
+
+macOS 上可以用 `launchd` 把桥接设置成“登录后自动启动 + 常驻运行”（不需要 `screen`）。
+
+安装：
+
+```bash
+./scripts/install-launchd.sh
+```
+
+卸载：
+
+```bash
+./scripts/uninstall-launchd.sh
+```
+
+说明：
+
+- 这是用户级 `LaunchAgent`，会在你登录 macOS 后启动（通常就够用了）。
+- 安装脚本会把运行副本复制到配置目录下的 `runtime/bin`，避免后台进程直接从 `Documents` 这类受 macOS 隐私保护的目录执行。
+- 如需使用自定义配置目录，运行安装脚本前先设置 `LARK_CODEX_BASE_DIR`，例如：
+  `LARK_CODEX_BASE_DIR="$HOME/.lark-codex" ./scripts/install-launchd.sh`
+
 ## 常用命令
 
 在飞书/Lark 机器人里发送：
 
-终端风格命令是主入口；中文命令继续兼容。
+默认命令模式是 `slash`：系统级操作必须用 `/` 前缀（例如 `/目录`、`/切换 2`），保证普通对话不会被误判成命令而“拦截”；未加 `/` 的内容会直接作为输入发给当前 thread/session。
+
+如需兼容旧用法（不加 `/` 也能触发命令），在 `.env` 里设置：`LARK_CODEX_COMMAND_MODE=both`。
 
 ```text
-status
+/status
 ```
 
 查看桥接状态。
 
 ```text
-目录
+/目录
 ```
 
 用卡片列出当前会话、置顶会话和最近会话编号。也支持：
 
 ```text
-sessions
+/sessions
 ```
 
 ```text
-切换 1
+/切换 1
 ```
 
 把编号 `1` 设为当前“常驻会话”。之后普通消息会一直进入这个会话，直到再次切换或清除。
@@ -123,94 +148,94 @@ sessions
 也支持别名：
 
 ```text
-常驻 1
-attach 1
+/常驻 1
+/attach 1
 ```
 
 ```text
-当前会话
-current
+/当前会话
+/current
 ```
 
 查看当前绑定的本地 Codex 会话。
 
 ```text
-清除会话
-detach
+/清除会话
+/detach
 ```
 
 取消当前会话绑定。之后普通消息会创建新任务。
 
 ```text
-新任务 帮我整理这个仓库
-new 帮我整理这个仓库
+/新任务 帮我整理这个仓库
+/new 帮我整理这个仓库
 ```
 
 绕过当前会话，强制创建一个新的 terminal task，但不把它设为常驻会话。默认仍使用可恢复长任务模型。
 
 ```text
-新会话 帮我整理这个仓库
+/新会话 帮我整理这个仓库
 ```
 
 创建一个新的 Codex 会话，任务完成后自动把它设为当前常驻会话。
 
 ```text
-新会话
+/新会话
 ```
 
 进入新会话待命状态。下一条普通消息会创建新的 Codex 会话，并自动常驻到这个新会话。
 
 ```text
-长任务 生成并写回这张表的前 3 行设计图
+/长任务 生成并写回这张表的前 3 行设计图
 ```
 
 以长任务模式执行，默认超时 `LARK_CODEX_LONG_TASK_TIMEOUT_SECONDS=3600`。适合图片生成、批量写表、长时间代码迁移等任务。
 
 ```text
-任务
-tasks
+/任务
+/tasks
 ```
 
 `任务` 查看最近长任务状态、原始需求、尝试次数、已记录产物和下一步命令。`tasks` 列出最近任务。
 
 ```text
-继续任务
-continue
+/继续任务
+/continue
 ```
 
 从最近失败或暂停的长任务继续。桥接会把原始需求、已记录产物和最近日志摘要一起发给 Codex，避免从头重做。若旧版本没有长任务记录，但当前窗口已有常驻会话，也会自动升级为长任务继续。
 
 ```text
-会话 1
+/会话 1
 ```
 
 查看编号 `1` 的最近进度。
 
 ```text
-同步会话 1 10分钟
+/同步会话 1 10分钟
 ```
 
 同步编号 `1` 的输出 10 分钟。同步只在有新事件时推送，不会定期刷屏。
 
 ```text
-cd /path
-pwd
+/cd /path
+/pwd
 ```
 
 设置/查看本聊天窗口默认工作目录（新任务会用这个目录）。
 
 ```text
-debug on
-debug off
+/debug on
+/debug off
 ```
 
 控制卡片折叠区的详细程度（默认 `off`）。
 
 ```text
-syncmode stream
-syncmode screen
-update on
-update off
+/syncmode stream
+/syncmode screen
+/update on
+/update off
 ```
 
 同步输出模式。`screen` 会尽量更新同一张卡片（需要 `im:message:update` 权限；失败自动降级为逐条 `stream`）。

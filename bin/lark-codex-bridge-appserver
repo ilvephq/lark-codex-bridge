@@ -10,6 +10,7 @@ const { spawn } = require("node:child_process");
 
 const env = loadEnv();
 const config = buildConfig(env);
+const RUN_SELF_TEST = process.argv.includes("--self-test");
 
 const state = {
   token: "",
@@ -22,11 +23,6 @@ const state = {
   larkSubscriber: null,
   lastSubscribeLockReclaimAt: 0,
 };
-
-if (process.argv.includes("--self-test")) {
-  runSelfTest();
-  process.exit(0);
-}
 
 async function main() {
   acquireBridgeLock();
@@ -85,6 +81,7 @@ function buildConfig(source) {
   const stateDir = expandHome(source.LARK_CODEX_STATE_DIR || path.join(baseDir, "state"));
   const approvalUi = oneOf(source.LARK_CODEX_APPROVAL_UI || "buttons", ["buttons", "text", "both"], "buttons");
   const backendListen = source.LARK_CODEX_APP_SERVER_LISTEN || "stdio://";
+  const commandMode = oneOf(source.LARK_CODEX_COMMAND_MODE || "slash", ["slash", "both", "legacy"], "slash");
   const subscribeLockPolicy = oneOf(
     source.LARK_CODEX_SUBSCRIBE_LOCK_POLICY || "reclaim",
     ["reclaim", "error", "ignore"],
@@ -115,6 +112,7 @@ function buildConfig(source) {
     ackReactionEmoji: source.LARK_CODEX_ACK_REACTION_EMOJI || "OK",
     listen: backendListen,
     subscribeLockPolicy,
+    commandMode,
   };
 }
 
@@ -745,39 +743,133 @@ async function handleMessageEvent(event) {
   await dispatchPrompt(ctx, event.messageId, prompt);
 }
 
+const SLASH_COMMANDS = new Set([
+  "help",
+  "status",
+  "logs",
+  "queue",
+  "sessions",
+  "directory",
+  "current",
+  "detach",
+  "pwd",
+  "cd",
+  "cwd",
+  "debug",
+  "syncmode",
+  "update",
+  "tasks",
+  "task",
+  "jobs",
+  "job",
+  "continue",
+  "resume",
+  "long",
+  "new",
+  "session",
+  "attach",
+  "switch",
+  "approve",
+  "allow",
+  "deny",
+  "decline",
+  "cancel",
+  "answer",
+  // Chinese aliases
+  "帮助",
+  "状态",
+  "日志",
+  "队列",
+  "目录",
+  "会话目录",
+  "当前会话",
+  "清除会话",
+  "取消会话",
+  "同步模式",
+  "更新",
+  "任务",
+  "继续任务",
+  "长任务",
+  "新会话",
+  "新对话",
+  "新任务",
+  "会话",
+  "常驻",
+  "切换",
+  "切换会话",
+  "停止同步",
+  "同步会话",
+]);
+
+function slashCommandLine(prompt) {
+  if (!prompt || !prompt.startsWith("/")) return "";
+  const raw = String(prompt).slice(1).trim();
+  if (!raw) return "help";
+
+  // Support compact forms like "/切换2" or "/attach1 10分钟".
+  const compactMatch = raw.match(/^(切换|常驻|attach|switch)\s*([0-9]+)(.*)$/i);
+  if (compactMatch) {
+    const verb = compactMatch[1];
+    const ref = compactMatch[2];
+    const rest = String(compactMatch[3] || "").trim();
+    return `${verb} ${ref}${rest ? " " + rest : ""}`.trim();
+  }
+
+  const first = raw.split(/\s+/)[0] || "";
+  const lowerFirst = first.toLowerCase();
+  if (SLASH_COMMANDS.has(first) || SLASH_COMMANDS.has(lowerFirst)) return raw;
+  return "";
+}
+
 async function dispatchPrompt(ctx, messageId, prompt) {
-  const lower = prompt.toLowerCase();
-  if (lower === "help" || prompt === "帮助") return replyHelp(messageId);
-  if (lower === "status" || prompt === "状态") return replyStatus(ctx, messageId);
-  if (lower === "logs" || prompt === "日志") return replyLogs(messageId);
-  if (lower === "queue" || prompt === "队列") return replyQueue(messageId);
-  if (lower === "sessions" || prompt === "目录" || prompt === "会话目录") return replySessions(ctx, messageId);
-  if (lower === "current" || prompt === "当前会话") return replyCurrent(ctx, messageId);
-  if (lower === "detach" || prompt === "清除会话" || prompt === "取消会话") return detachThread(ctx, messageId);
-  if (lower === "pwd") return replyCard(messageId, noticeCard("pwd", "blue", `\`${ctx.settings.workdir}\``, ""));
-  if (/^(cd|cwd)\s+/.test(lower)) return changeCwd(ctx, messageId, prompt.replace(/^(cd|cwd)\s+/i, "").trim());
-  if (/^(approve|allow)\s+/.test(lower)) return approveByText(messageId, prompt, "allow");
-  if (/^(deny|decline)\s+/.test(lower)) return approveByText(messageId, prompt, "deny");
-  if (/^cancel\s+/.test(lower)) return approveByText(messageId, prompt, "cancel");
-  if (/^answer\s+/.test(lower)) return answerByText(messageId, prompt);
-  if (/^(attach|switch|常驻|切换|切换会话)\s*\S+/.test(prompt)) return attachThread(ctx, messageId, prompt);
-  if (/^(session|会话)\s*\S+/.test(prompt)) return showThread(ctx, messageId, prompt);
-  if (/^(new session|new chat|新会话|新对话)\s*$/i.test(prompt)) {
-    ctx.newSessionPending = true;
-    saveChatContext(ctx);
-    return replyCard(messageId, noticeCard("new session", "blue", "Next normal message will create and attach a new Codex thread.", ""));
-  }
-  if (/^(new session|new chat|新会话|新对话)\s+/i.test(prompt)) {
-    return startTask(ctx, messageId, prompt.replace(/^(new session|new chat|新会话|新对话)\s+/i, ""), {
-      forceNew: true,
-      attach: true,
-    });
-  }
-  if (/^(new|新任务)\s+/i.test(prompt)) {
-    return startTask(ctx, messageId, prompt.replace(/^(new|新任务)\s+/i, ""), {
-      forceNew: true,
-      attach: false,
-    });
+  let effective = prompt;
+  const slash = slashCommandLine(prompt);
+  const hasSlashCmd = Boolean(slash);
+  const mode = config.commandMode || "slash";
+  const allowCommands = mode !== "slash" || hasSlashCmd;
+
+  // In slash mode, ONLY slash-prefixed known commands are treated as commands.
+  // This prevents accidental command triggers when the user is just chatting or
+  // pasting short words that overlap with built-in commands.
+  if (hasSlashCmd && (mode === "slash" || mode === "both")) effective = slash;
+
+  if (allowCommands) {
+    const lower = effective.toLowerCase();
+    if (lower === "help" || effective === "帮助") return replyHelp(messageId);
+    if (lower === "status" || effective === "状态") return replyStatus(ctx, messageId);
+    if (lower === "logs" || effective === "日志") return replyLogs(messageId);
+    if (lower === "queue" || effective === "队列") return replyQueue(messageId);
+    if (lower === "sessions" || effective === "目录" || effective === "会话目录") return replySessions(ctx, messageId);
+    if (lower === "current" || effective === "当前会话") return replyCurrent(ctx, messageId);
+    if (lower === "detach" || effective === "清除会话" || effective === "取消会话") return detachThread(ctx, messageId);
+    if (lower === "pwd") return replyCard(messageId, noticeCard("pwd", "blue", `\`${ctx.settings.workdir}\``, ""));
+    if (/^(cd|cwd)\s+/.test(lower)) return changeCwd(ctx, messageId, effective.replace(/^(cd|cwd)\s+/i, "").trim());
+    if (/^(approve|allow)\s+/.test(lower)) return approveByText(messageId, effective, "allow");
+    if (/^(deny|decline)\s+/.test(lower)) return approveByText(messageId, effective, "deny");
+    if (/^cancel\s+/.test(lower)) return approveByText(messageId, effective, "cancel");
+    if (/^answer\s+/.test(lower)) return answerByText(messageId, effective);
+    if (/^(attach|switch|常驻|切换|切换会话)\s*\S+/.test(effective)) return attachThread(ctx, messageId, effective);
+    if (/^(session|会话)\s*\S+/.test(effective)) return showThread(ctx, messageId, effective);
+    if (/^(new session|new chat|新会话|新对话)\s*$/i.test(effective)) {
+      ctx.newSessionPending = true;
+      saveChatContext(ctx);
+      return replyCard(
+        messageId,
+        noticeCard("new session", "blue", "Next normal message will create and attach a new Codex thread.", ""),
+      );
+    }
+    if (/^(new session|new chat|新会话|新对话)\s+/i.test(effective)) {
+      return startTask(ctx, messageId, effective.replace(/^(new session|new chat|新会话|新对话)\s+/i, ""), {
+        forceNew: true,
+        attach: true,
+      });
+    }
+    if (/^(new|新任务)\s+/i.test(effective)) {
+      return startTask(ctx, messageId, effective.replace(/^(new|新任务)\s+/i, ""), {
+        forceNew: true,
+        attach: false,
+      });
+    }
   }
   if (ctx.newSessionPending) {
     ctx.newSessionPending = false;
@@ -955,16 +1047,17 @@ function drainQueue() {
 }
 
 async function replyHelp(messageId) {
+  const prefix = config.commandMode === "slash" ? "/" : "";
   const body = [
-    "`sessions` list threads",
-    "`attach 1` switch current thread",
-    "`current` show current thread",
-    "`new <prompt>` start isolated thread",
-    "`new session <prompt>` start and attach thread",
-    "`detach` clear current thread",
-    "`approve <id>` / `deny <id>` text approval fallback",
-    "`pwd` / `cd /path` workdir",
-    "`status` / `queue` / `logs`",
+    `\`${prefix}sessions\` list threads`,
+    `\`${prefix}attach 1\` switch current thread`,
+    `\`${prefix}current\` show current thread`,
+    `\`${prefix}new <prompt>\` start isolated thread`,
+    `\`${prefix}new session <prompt>\` start and attach thread`,
+    `\`${prefix}detach\` clear current thread`,
+    `\`${prefix}approve <id>\` / \`${prefix}deny <id>\` text approval fallback`,
+    `\`${prefix}pwd\` / \`${prefix}cd /path\` workdir`,
+    `\`${prefix}status\` / \`${prefix}queue\` / \`${prefix}logs\``,
   ].join("\n");
   await replyCard(messageId, noticeCard("terminal help", "blue", body, ""));
 }
@@ -1614,11 +1707,19 @@ function runSelfTest() {
   const commandResponse = responseForApproval(approval, "allow");
   const sessionResponse = responseForApproval(approval, "allow-session");
   const denyResponse = responseForApproval(approval, "deny");
+  if (slashCommandLine("/切换2") !== "切换 2") throw new Error("slash compact switch parse failed");
+  if (slashCommandLine("/sessions") !== "sessions") throw new Error("slash sessions parse failed");
+  if (slashCommandLine("sessions") !== "") throw new Error("plain command should not parse as slash command");
   JSON.parse(JSON.stringify(card));
   JSON.parse(JSON.stringify(commandResponse));
   JSON.parse(JSON.stringify(sessionResponse));
   JSON.parse(JSON.stringify(denyResponse));
   console.log(JSON.stringify({ ok: true, card, commandResponse, sessionResponse, denyResponse }));
+}
+
+if (RUN_SELF_TEST) {
+  runSelfTest();
+  process.exit(0);
 }
 
 main().catch((error) => {

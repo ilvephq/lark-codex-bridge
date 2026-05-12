@@ -1,0 +1,1752 @@
+#!/usr/bin/env node
+"use strict";
+
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const readline = require("node:readline");
+const { spawn } = require("node:child_process");
+
+const env = loadEnv();
+const config = buildConfig(env);
+const RUN_SELF_TEST = process.argv.includes("--self-test");
+
+const state = {
+  token: "",
+  tokenExpiresAt: 0,
+  chats: new Map(),
+  runningByThread: new Map(),
+  tasksByTurn: new Map(),
+  pendingApprovals: new Map(),
+  queue: [],
+  larkSubscriber: null,
+  lastSubscribeLockReclaimAt: 0,
+};
+
+async function main() {
+  acquireBridgeLock();
+  fs.mkdirSync(config.stateDir, { recursive: true });
+  fs.mkdirSync(config.chatsDir, { recursive: true });
+  fs.mkdirSync(config.approvalsDir, { recursive: true });
+
+  assertConfig();
+  const codex = new CodexAppServer(config);
+  await codex.start();
+  state.codex = codex;
+
+  await refreshTenantToken();
+  log("backend=app-server ready");
+
+  startQueueLoop();
+  startLarkSubscriber().catch((error) => {
+    log(`lark-subscriber-start-error ${error.stack || error.message || error}`);
+  });
+}
+
+function loadEnv() {
+  const merged = { ...process.env };
+  const baseDir = merged.LARK_CODEX_BASE_DIR || path.join(os.homedir(), ".lark-codex");
+  const credFile = merged.LARK_CODEX_CREDENTIALS || path.join(expandHome(baseDir), ".env");
+  if (fs.existsSync(credFile)) {
+    for (const [key, value] of Object.entries(parseEnvFile(credFile))) {
+      if (merged[key] === undefined) merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+function parseEnvFile(file) {
+  const out = {};
+  const text = fs.readFileSync(file, "utf8");
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+    let value = match[2].trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    out[match[1]] = expandHome(value);
+  }
+  return out;
+}
+
+function buildConfig(source) {
+  const baseDir = expandHome(source.LARK_CODEX_BASE_DIR || path.join(os.homedir(), ".lark-codex"));
+  const stateDir = expandHome(source.LARK_CODEX_STATE_DIR || path.join(baseDir, "state"));
+  const approvalUi = oneOf(source.LARK_CODEX_APPROVAL_UI || "buttons", ["buttons", "text", "both"], "buttons");
+  const backendListen = source.LARK_CODEX_APP_SERVER_LISTEN || "stdio://";
+  const commandMode = oneOf(source.LARK_CODEX_COMMAND_MODE || "slash", ["slash", "both", "legacy"], "slash");
+  const mobileLayout = stringBool(source.LARK_CODEX_CARD_MOBILE_LAYOUT, true);
+  const outputLimit = intValue(source.LARK_CODEX_OUTPUT_LIMIT_CHARS || source.LARK_CODEX_MAX_REPLY_CHARS, 12000);
+  const subscribeLockPolicy = oneOf(
+    source.LARK_CODEX_SUBSCRIBE_LOCK_POLICY || "reclaim",
+    ["reclaim", "error", "ignore"],
+    "reclaim",
+  );
+  return {
+    baseDir,
+    stateDir,
+    chatsDir: path.join(stateDir, "chats"),
+    approvalsDir: path.join(stateDir, "approvals"),
+    bridgeLockDir: path.join(stateDir, "bridge.lock"),
+    bridgeLockPidFile: path.join(stateDir, "bridge.lock", "pid"),
+    appId: source.LARKSUITE_CLI_APP_ID || source.FEISHU_APP_ID || "",
+    appSecret: source.LARKSUITE_CLI_APP_SECRET || source.FEISHU_APP_SECRET || "",
+    allowedSender: source.LARK_CODEX_ALLOWED_SENDER || "",
+    codexBin: source.LARK_CODEX_BIN || "codex",
+    model: source.LARK_CODEX_MODEL || "gpt-5.2",
+    defaultWorkdir: expandHome(source.LARK_CODEX_WORKDIR || os.homedir()),
+    outputLimit,
+    cardBodyLimit: intValue(
+      source.LARK_CODEX_CARD_BODY_LIMIT_CHARS,
+      mobileLayout ? Math.min(outputLimit, 4000) : outputLimit,
+    ),
+    cardDetailLimit: intValue(source.LARK_CODEX_CARD_DETAIL_LIMIT_CHARS, mobileLayout ? 2000 : 4000),
+    mobileLineChars: intValue(source.LARK_CODEX_CARD_MOBILE_LINE_CHARS, 88),
+    mobileLayout,
+    approvalUi,
+    approvalTimeoutSeconds: intValue(source.LARK_CODEX_APPROVAL_TIMEOUT_SECONDS, 600),
+    approvalAllowSession: stringBool(source.LARK_CODEX_APPROVAL_ALLOW_SESSION, true),
+    approvalPolicy: source.LARK_CODEX_APPROVAL_POLICY || "on-request",
+    terminalRender: oneOf(source.LARK_CODEX_TERMINAL_RENDER || "screen", ["screen", "stream"], "screen"),
+    enableMessageUpdate: stringBool(source.LARK_CODEX_ENABLE_MESSAGE_UPDATE, false),
+    ackMode: oneOf(source.LARK_CODEX_ACK_MODE || "reaction", ["reaction", "text", "both"], "reaction"),
+    ackEmoji: source.LARK_CODEX_ACK_EMOJI || "👀",
+    ackReactionEmoji: source.LARK_CODEX_ACK_REACTION_EMOJI || "OK",
+    listen: backendListen,
+    subscribeLockPolicy,
+    commandMode,
+  };
+}
+
+function subscribeLockFile() {
+  if (!config.appId) return "";
+  return path.join(os.homedir(), ".lark-cli", "locks", `subscribe_${config.appId}.lock`);
+}
+
+function runCapture(cmd, args, opts = {}) {
+  const { timeoutMs = 3000 } = opts;
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch (_) {}
+      reject(new Error(`${cmd} timed out`));
+    }, timeoutMs);
+    child.stdout.on("data", (c) => {
+      stdout += String(c);
+    });
+    child.stderr.on("data", (c) => {
+      stderr += String(c);
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      // lsof returns exit code 1 when nothing matched; treat that as empty output.
+      if (code === 0 || (cmd === "lsof" && code === 1)) return resolve({ stdout, stderr, code });
+      const msg = stderr.trim() || stdout.trim() || `${cmd} exited code=${code}`;
+      reject(new Error(msg));
+    });
+  });
+}
+
+async function reclaimSubscribeLock(reason) {
+  if (config.subscribeLockPolicy !== "reclaim") return false;
+  const lockFile = subscribeLockFile();
+  if (!lockFile || !fs.existsSync(lockFile)) return false;
+
+  const now = Date.now();
+  // Avoid kill loops if `lark-cli` is flapping for some other reason.
+  if (now - state.lastSubscribeLockReclaimAt < 60_000) return false;
+  state.lastSubscribeLockReclaimAt = now;
+
+  // Find who is holding the lock. If `lsof` isn't available, we can't safely reclaim.
+  try {
+    await runCapture("lsof", ["-t", lockFile], { timeoutMs: 2000 });
+  } catch (error) {
+    log(`subscribe-lock reclaim skipped (${reason}): lsof failed: ${error.message || error}`);
+    return false;
+  }
+
+  let pidsText = "";
+  try {
+    const out = await runCapture("lsof", ["-t", lockFile], { timeoutMs: 2000 });
+    pidsText = out.stdout || "";
+  } catch (_) {
+    pidsText = "";
+  }
+  const pids = pidsText
+    .trim()
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter((s) => /^[0-9]+$/.test(s));
+  if (pids.length === 0) {
+    // Stale file with no holder.
+    try {
+      fs.rmSync(lockFile, { force: true });
+      log(`subscribe-lock reclaimed (${reason}): removed stale lock file`);
+      return true;
+    } catch (error) {
+      log(`subscribe-lock reclaim failed (${reason}): ${error.message || error}`);
+      return false;
+    }
+  }
+
+  log(`subscribe-lock reclaimed (${reason}): stopping stale lark-cli pid(s)=${pids.join(",")}`);
+  for (const pid of pids) {
+    try {
+      process.kill(Number(pid), "SIGTERM");
+    } catch (_) {}
+  }
+  await new Promise((r) => setTimeout(r, 800));
+  for (const pid of pids) {
+    try {
+      process.kill(Number(pid), 0);
+      process.kill(Number(pid), "SIGKILL");
+    } catch (_) {}
+  }
+  try {
+    fs.rmSync(lockFile, { force: true });
+  } catch (_) {}
+  return true;
+}
+
+function assertConfig() {
+  if (!config.appId) throw new Error("Missing LARKSUITE_CLI_APP_ID");
+  if (!config.appSecret) throw new Error("Missing LARKSUITE_CLI_APP_SECRET");
+  if (!config.allowedSender) throw new Error("Missing LARK_CODEX_ALLOWED_SENDER");
+  if (config.listen !== "stdio://" && config.listen !== "stdio") {
+    throw new Error("app-server mode currently supports LARK_CODEX_APP_SERVER_LISTEN=stdio:// only");
+  }
+}
+
+function acquireBridgeLock() {
+  fs.mkdirSync(path.dirname(config.bridgeLockDir), { recursive: true });
+  try {
+    fs.mkdirSync(config.bridgeLockDir);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    const pid = readText(config.bridgeLockPidFile).trim();
+    if (pid && isProcessAlive(pid)) {
+      throw new Error(`Bridge already running (pid=${pid})`);
+    }
+    fs.rmSync(config.bridgeLockDir, { recursive: true, force: true });
+    fs.mkdirSync(config.bridgeLockDir);
+  }
+  fs.writeFileSync(config.bridgeLockPidFile, String(process.pid));
+  const cleanup = () => {
+    stopChildProcesses();
+    try {
+      fs.rmSync(config.bridgeLockDir, { recursive: true, force: true });
+    } catch (_) {}
+  };
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(130);
+  });
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(143);
+  });
+}
+
+function isProcessAlive(pid) {
+  if (!/^[0-9]+$/.test(pid)) return false;
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function stopChildProcesses() {
+  try {
+    if (state.larkSubscriber && !state.larkSubscriber.killed) {
+      state.larkSubscriber.kill("SIGTERM");
+    }
+  } catch (_) {}
+  try {
+    if (state.codex?.child && !state.codex.child.killed) {
+      state.codex.child.kill("SIGTERM");
+    }
+  } catch (_) {}
+}
+
+class CodexAppServer {
+  constructor(cfg) {
+    this.cfg = cfg;
+    this.child = null;
+    this.nextId = 1;
+    this.pending = new Map();
+  }
+
+  async start() {
+    this.child = spawn(this.cfg.codexBin, ["app-server", "--listen", "stdio://"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+    });
+    this.child.stderr.on("data", (chunk) => {
+      const text = String(chunk).trim();
+      if (text) log(`codex ${text}`);
+    });
+    this.child.on("exit", (code, signal) => {
+      log(`codex app-server exited code=${code} signal=${signal || ""}`);
+      for (const { reject } of this.pending.values()) {
+        reject(new Error("codex app-server exited"));
+      }
+      this.pending.clear();
+    });
+    const rl = readline.createInterface({ input: this.child.stdout });
+    rl.on("line", (line) => this.handleLine(line));
+    await this.request("initialize", {
+      clientInfo: { name: "lark-codex-bridge", version: "0.2.0" },
+      capabilities: null,
+    });
+    this.notify("initialized");
+  }
+
+  handleLine(line) {
+    if (!line.trim()) return;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch (error) {
+      log(`codex invalid-json ${line.slice(0, 500)}`);
+      return;
+    }
+    if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+      const pending = this.pending.get(msg.id);
+      if (!pending) return;
+      this.pending.delete(msg.id);
+      if (msg.error) pending.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+      else pending.resolve(msg.result);
+      return;
+    }
+    if (msg.id !== undefined && msg.method) {
+      handleCodexRequest(msg).catch((error) => {
+        log(`codex-request-error ${msg.method} ${error.stack || error.message || error}`);
+        this.respond(msg.id, {});
+      });
+      return;
+    }
+    if (msg.method) {
+      handleCodexNotification(msg).catch((error) => {
+        log(`codex-notification-error ${msg.method} ${error.stack || error.message || error}`);
+      });
+    }
+  }
+
+  request(method, params = {}) {
+    const id = this.nextId++;
+    const payload = { method, id, params };
+    const data = `${JSON.stringify(payload)}\n`;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.child.stdin.write(data, (error) => {
+        if (!error) return;
+        this.pending.delete(id);
+        reject(error);
+      });
+    });
+  }
+
+  notify(method, params) {
+    this.child.stdin.write(`${JSON.stringify(params === undefined ? { method } : { method, params })}\n`);
+  }
+
+  respond(id, result) {
+    this.child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+  }
+}
+
+async function handleCodexNotification(msg) {
+  const params = msg.params || {};
+  const threadId = params.threadId || params.thread?.id;
+  const turnId = params.turnId || params.turn?.id;
+  if (!threadId) return;
+
+  if (msg.method === "thread/started" && params.thread?.id) {
+    rememberThread(params.thread);
+    return;
+  }
+
+  if (msg.method === "turn/started") {
+    const task = taskForTurn(threadId, turnId);
+    if (task) {
+      task.turnId = turnId;
+      task.state = "RUNNING";
+      await updateTaskCard(task, "RUNNING", "working...");
+    }
+    return;
+  }
+
+  if (msg.method === "item/agentMessage/delta") {
+    const task = taskForTurn(threadId, turnId);
+    if (task && params.delta) {
+      appendTaskOutput(task, params.delta, "main");
+      await patchTaskCardThrottled(task, "RUNNING");
+    }
+    return;
+  }
+
+  // Keep plans/reasoning out of the main terminal stream (too noisy on mobile).
+  // We still capture them in debug output when enabled for the chat.
+  if (msg.method === "item/plan/delta" || msg.method === "item/reasoning/summaryTextDelta") {
+    const task = taskForTurn(threadId, turnId);
+    if (task && params.delta) {
+      const ctx = chatContext(task.chatId);
+      if (ctx.settings?.debug) appendTaskOutput(task, params.delta, "debug");
+    }
+    return;
+  }
+
+  if (
+    msg.method === "item/commandExecution/outputDelta" ||
+    msg.method === "command/exec/outputDelta" ||
+    msg.method === "item/fileChange/outputDelta"
+  ) {
+    const task = taskForTurn(threadId, turnId);
+    if (task && params.delta) {
+      // Tool output is useful, but often noisy; keep it under collapsible details.
+      appendTaskOutput(task, params.delta, "debug");
+      await patchTaskCardThrottled(task, "RUNNING");
+    }
+    return;
+  }
+
+  if (msg.method === "item/fileChange/patchUpdated") {
+    const task = taskForTurn(threadId, turnId);
+    if (task) {
+      const changed = Array.isArray(params.changes) ? params.changes.length : 0;
+      appendTaskOutput(task, `\n[file changes: ${changed}]\n`, "debug");
+      await patchTaskCardThrottled(task, "RUNNING");
+    }
+    return;
+  }
+
+  if (msg.method === "turn/completed") {
+    const task = taskForTurn(threadId, params.turn?.id || turnId);
+    if (task) {
+      task.state = params.turn?.status === "failed" ? "FAILED" : "DONE";
+      const error = params.turn?.error ? stringifyCompact(params.turn.error) : "";
+      await updateTaskCard(task, task.state, task.output || (task.state === "DONE" ? "done." : error || "failed."));
+      await addReaction(task.sourceMessageId, task.state === "DONE" ? "DONE" : "CROSS");
+      finishTask(task);
+      drainQueue();
+    }
+  }
+}
+
+async function handleCodexRequest(msg) {
+  const method = msg.method;
+  if (
+    method === "item/commandExecution/requestApproval" ||
+    method === "item/fileChange/requestApproval" ||
+    method === "item/permissions/requestApproval" ||
+    method === "item/tool/requestUserInput" ||
+    method === "execCommandApproval" ||
+    method === "applyPatchApproval"
+  ) {
+    await createApproval(msg);
+    return;
+  }
+  state.codex.respond(msg.id, {});
+}
+
+async function createApproval(request) {
+  const params = request.params || {};
+  const threadId = params.threadId || params.conversationId || "";
+  const turnId = params.turnId || "";
+  const task = taskForTurn(threadId, turnId) || state.runningByThread.get(threadId);
+  const chatId = task?.chatId || findChatByThread(threadId)?.chatId || "unknown";
+  const ctx = chatContext(chatId);
+  const approvalId = shortNonce();
+  const expiresAt = Date.now() + config.approvalTimeoutSeconds * 1000;
+  const approval = {
+    id: approvalId,
+    requestId: request.id,
+    method: request.method,
+    params,
+    threadId,
+    turnId,
+    itemId: params.itemId || params.callId || "",
+    chatId,
+    sourceMessageId: task?.sourceMessageId || ctx.lastSourceMessageId || "",
+    cardMessageId: task?.cardMessageId || "",
+    nonce: shortNonce(),
+    expiresAt,
+    resolved: false,
+  };
+  state.pendingApprovals.set(approvalId, approval);
+  writeJson(path.join(config.approvalsDir, `${approvalId}.json`), approval);
+  if (task) {
+    task.approvals = [approval];
+    await updateTaskCard(task, "WAITING", task.output || "waiting for approval...");
+  } else if (approval.sourceMessageId) {
+    await replyCard(approval.sourceMessageId, approvalCard(approval, null));
+  }
+  log(`approval pending id=${approvalId} method=${request.method} thread=${threadId}`);
+}
+
+async function resolveApproval(approvalId, action, answerText = "") {
+  const approval = findApproval(approvalId);
+  if (!approval) return { ok: false, text: `approval not found: ${approvalId}` };
+  if (approval.resolved) return { ok: true, text: `approval already resolved: ${approval.id}` };
+  if (Date.now() > approval.expiresAt) {
+    approval.resolved = true;
+    state.codex.respond(approval.requestId, responseForApproval(approval, "deny", answerText));
+    return { ok: false, text: `approval expired: ${approval.id}` };
+  }
+  approval.resolved = true;
+  approval.resolvedAt = new Date().toISOString();
+  approval.action = action;
+  writeJson(path.join(config.approvalsDir, `${approval.id}.json`), approval);
+  state.codex.respond(approval.requestId, responseForApproval(approval, action, answerText));
+  const task = taskForTurn(approval.threadId, approval.turnId) || state.runningByThread.get(approval.threadId);
+  if (task) {
+    task.approvals = [];
+    appendTaskOutput(task, `\n[approval: ${action}]\n`);
+    await updateTaskCard(task, "RUNNING", task.output || "working...");
+  }
+  return { ok: true, text: `approval ${action}: ${approval.id}` };
+}
+
+function responseForApproval(approval, action, answerText) {
+  const method = approval.method;
+  const params = approval.params || {};
+  if (method === "item/commandExecution/requestApproval") {
+    return { decision: decision(action, "accept", "acceptForSession", "decline", "cancel") };
+  }
+  if (method === "item/fileChange/requestApproval") {
+    return { decision: decision(action, "accept", "acceptForSession", "decline", "cancel") };
+  }
+  if (method === "execCommandApproval" || method === "applyPatchApproval") {
+    return { decision: decision(action, "approved", "approved_for_session", "denied", "abort") };
+  }
+  if (method === "item/permissions/requestApproval") {
+    if (action === "allow-session") {
+      return { permissions: grantedPermissions(params.permissions), scope: "session" };
+    }
+    if (action === "allow" || action === "allow-turn") {
+      return { permissions: grantedPermissions(params.permissions), scope: "turn" };
+    }
+    return { permissions: {}, scope: "turn" };
+  }
+  if (method === "item/tool/requestUserInput") {
+    if (action === "deny" || action === "cancel") {
+      return { answers: {} };
+    }
+    const questions = Array.isArray(params.questions) ? params.questions : [];
+    const answers = {};
+    for (const question of questions) {
+      answers[question.id] = { answers: [answerText || firstOption(question) || ""] };
+    }
+    return { answers };
+  }
+  return {};
+}
+
+function decision(action, allow, allowSession, deny, cancel) {
+  if (action === "allow-session") return allowSession;
+  if (action === "cancel") return cancel;
+  if (action === "deny") return deny;
+  return allow;
+}
+
+function grantedPermissions(permissions) {
+  const granted = {};
+  if (permissions?.network) granted.network = permissions.network;
+  if (permissions?.fileSystem) granted.fileSystem = permissions.fileSystem;
+  return granted;
+}
+
+function firstOption(question) {
+  if (!Array.isArray(question.options) || question.options.length === 0) return "";
+  return question.options[0]?.label || "";
+}
+
+async function startLarkSubscriber() {
+  try {
+    if (state.larkSubscriber && !state.larkSubscriber.killed) {
+      state.larkSubscriber.kill("SIGTERM");
+    }
+  } catch (_) {}
+  if (config.subscribeLockPolicy === "reclaim") {
+    // Best-effort cleanup so we don't get stuck in a noisy reconnect loop.
+    await reclaimSubscribeLock("startup");
+  }
+  const args = [
+    "event",
+    "+subscribe",
+    "--quiet",
+    // Avoid subscribing to every possible event type (which can spam stderr with
+    // SDK "not found handler" noise). We only need message input + card button callbacks.
+    "--event-types",
+    "im.message.receive_v1,card.action.trigger",
+  ];
+  log(`lark subscribe ${args.join(" ")}`);
+  const child = spawn("lark-cli", args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+  state.larkSubscriber = child;
+  let sawSubscribeLockError = false;
+  child.stderr.on("data", (chunk) => {
+    const text = String(chunk).trim();
+    if (text) {
+      if (text.includes("another event +subscribe instance is already running")) {
+        sawSubscribeLockError = true;
+      }
+      log(`lark ${text}`);
+    }
+  });
+  const rl = readline.createInterface({ input: child.stdout });
+  rl.on("line", (line) => {
+    handleLarkLine(line).catch((error) => {
+      log(`lark-event-error ${error.stack || error.message || error}`);
+    });
+  });
+  child.on("exit", (code, signal) => {
+    if (state.larkSubscriber === child) state.larkSubscriber = null;
+    log(`lark subscribe exited code=${code} signal=${signal || ""}; reconnecting`);
+    if (code === 2 && sawSubscribeLockError && config.subscribeLockPolicy === "reclaim") {
+      reclaimSubscribeLock("subscribe-lock").finally(() => {
+        setTimeout(() => {
+          startLarkSubscriber().catch((error) => {
+            log(`lark-subscriber-start-error ${error.stack || error.message || error}`);
+          });
+        }, 1000);
+      });
+      return;
+    }
+    setTimeout(() => {
+      startLarkSubscriber().catch((error) => {
+        log(`lark-subscriber-start-error ${error.stack || error.message || error}`);
+      });
+    }, 2000);
+  });
+}
+
+async function handleLarkLine(line) {
+  if (!line.trim()) return;
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch (_) {
+    log(`lark invalid-json ${line.slice(0, 500)}`);
+    return;
+  }
+  const kind = larkEventKind(event);
+  if (kind === "message") {
+    await handleMessageEvent(normalizeMessageEvent(event));
+  } else if (kind === "card_action") {
+    await handleCardActionEvent(normalizeCardActionEvent(event));
+  }
+}
+
+function larkEventKind(event) {
+  const type = event.event_type || event.header?.event_type || event.type || event.event?.type || "";
+  if (type === "card.action.trigger" || event.action || event.event?.action) return "card_action";
+  if (type === "im.message.receive_v1" || event.message_id || event.event?.message) return "message";
+  return "";
+}
+
+function normalizeMessageEvent(raw) {
+  const event = raw.event || raw;
+  const message = event.message || raw.message || raw;
+  const sender = event.sender || raw.sender || {};
+  return {
+    messageId: raw.message_id || message.message_id || message.open_message_id || "",
+    chatId: raw.chat_id || message.chat_id || message.chat?.id || "",
+    senderId:
+      raw.sender_id ||
+      sender.sender_id?.open_id ||
+      sender.open_id ||
+      sender.id?.open_id ||
+      "",
+    content: raw.content || message.content || "",
+  };
+}
+
+function normalizeCardActionEvent(raw) {
+  const event = raw.event || raw;
+  const action = event.action || raw.action || {};
+  const context = event.context || raw.context || {};
+  const operator = event.operator || raw.operator || {};
+  return {
+    messageId:
+      raw.message_id ||
+      context.open_message_id ||
+      context.message_id ||
+      event.open_message_id ||
+      event.message_id ||
+      "",
+    chatId:
+      raw.chat_id ||
+      context.open_chat_id ||
+      context.chat_id ||
+      event.open_chat_id ||
+      event.chat_id ||
+      "",
+    senderId:
+      raw.sender_id ||
+      operator.operator_id?.open_id ||
+      operator.open_id ||
+      event.sender?.sender_id?.open_id ||
+      "",
+    value: action.value || event.value || raw.value || {},
+  };
+}
+
+async function handleCardActionEvent(event) {
+  if (!event.senderId || event.senderId !== config.allowedSender) {
+    log(`ignored card sender=${event.senderId}`);
+    return;
+  }
+  const value = typeof event.value === "string" ? safeJson(event.value) || {} : event.value || {};
+  if (value.bridge !== "lark-codex-bridge" || !value.approval_id) return;
+  const approval = findApproval(value.approval_id);
+  if (!approval) return;
+  if (approval.chatId !== event.chatId && event.chatId) {
+    log(`ignored approval chat mismatch approval=${approval.id} event_chat=${event.chatId}`);
+    return;
+  }
+  if (approval.nonce !== value.nonce) {
+    log(`ignored approval nonce mismatch approval=${approval.id}`);
+    return;
+  }
+  const result = await resolveApproval(approval.id, value.action || "allow", value.answer || "");
+  if (event.messageId) {
+    await updateMessage(event.messageId, noticeCard("Approval", result.ok ? "green" : "red", result.text, ""));
+  }
+}
+
+async function handleMessageEvent(event) {
+  if (!event.messageId || !event.senderId) return;
+  if (event.senderId !== config.allowedSender) {
+    log(`ignored sender=${event.senderId}`);
+    return;
+  }
+  const chatId = event.chatId || "unknown";
+  const ctx = chatContext(chatId);
+  ctx.lastSourceMessageId = event.messageId;
+  saveChatContext(ctx);
+
+  const prompt = normalizePrompt(extractText(event.content));
+  await ackMessage(event.messageId);
+  if (!prompt) {
+    await replyCard(event.messageId, noticeCard("Ready", "blue", "Send a task, or use `help`.", ""));
+    return;
+  }
+  await dispatchPrompt(ctx, event.messageId, prompt);
+}
+
+const SLASH_COMMANDS = new Set([
+  "help",
+  "status",
+  "logs",
+  "queue",
+  "sessions",
+  "directory",
+  "current",
+  "detach",
+  "pwd",
+  "cd",
+  "cwd",
+  "debug",
+  "syncmode",
+  "update",
+  "tasks",
+  "task",
+  "jobs",
+  "job",
+  "continue",
+  "resume",
+  "long",
+  "new",
+  "session",
+  "attach",
+  "switch",
+  "approve",
+  "allow",
+  "deny",
+  "decline",
+  "cancel",
+  "answer",
+  // Chinese aliases
+  "帮助",
+  "状态",
+  "日志",
+  "队列",
+  "目录",
+  "会话目录",
+  "当前会话",
+  "清除会话",
+  "取消会话",
+  "同步模式",
+  "更新",
+  "任务",
+  "继续任务",
+  "长任务",
+  "新会话",
+  "新对话",
+  "新任务",
+  "会话",
+  "常驻",
+  "切换",
+  "切换会话",
+  "停止同步",
+  "同步会话",
+]);
+
+function slashCommandLine(prompt) {
+  if (!prompt || !prompt.startsWith("/")) return "";
+  const raw = String(prompt).slice(1).trim();
+  if (!raw) return "help";
+
+  // Support compact forms like "/切换2" or "/attach1 10分钟".
+  const compactMatch = raw.match(/^(切换|常驻|attach|switch)\s*([0-9]+)(.*)$/i);
+  if (compactMatch) {
+    const verb = compactMatch[1];
+    const ref = compactMatch[2];
+    const rest = String(compactMatch[3] || "").trim();
+    return `${verb} ${ref}${rest ? " " + rest : ""}`.trim();
+  }
+
+  const first = raw.split(/\s+/)[0] || "";
+  const lowerFirst = first.toLowerCase();
+  if (SLASH_COMMANDS.has(first) || SLASH_COMMANDS.has(lowerFirst)) return raw;
+  return "";
+}
+
+async function dispatchPrompt(ctx, messageId, prompt) {
+  let effective = prompt;
+  const slash = slashCommandLine(prompt);
+  const hasSlashCmd = Boolean(slash);
+  const mode = config.commandMode || "slash";
+  const allowCommands = mode !== "slash" || hasSlashCmd;
+
+  // In slash mode, ONLY slash-prefixed known commands are treated as commands.
+  // This prevents accidental command triggers when the user is just chatting or
+  // pasting short words that overlap with built-in commands.
+  if (hasSlashCmd && (mode === "slash" || mode === "both")) effective = slash;
+
+  if (allowCommands) {
+    const lower = effective.toLowerCase();
+    if (lower === "help" || effective === "帮助") return replyHelp(messageId);
+    if (lower === "status" || effective === "状态") return replyStatus(ctx, messageId);
+    if (lower === "logs" || effective === "日志") return replyLogs(messageId);
+    if (lower === "queue" || effective === "队列") return replyQueue(messageId);
+    if (lower === "sessions" || effective === "目录" || effective === "会话目录") return replySessions(ctx, messageId);
+    if (lower === "current" || effective === "当前会话") return replyCurrent(ctx, messageId);
+    if (lower === "detach" || effective === "清除会话" || effective === "取消会话") return detachThread(ctx, messageId);
+    if (lower === "pwd") return replyCard(messageId, noticeCard("pwd", "blue", `\`${ctx.settings.workdir}\``, ""));
+    if (/^(cd|cwd)\s+/.test(lower)) return changeCwd(ctx, messageId, effective.replace(/^(cd|cwd)\s+/i, "").trim());
+    if (/^(approve|allow)\s+/.test(lower)) return approveByText(messageId, effective, "allow");
+    if (/^(deny|decline)\s+/.test(lower)) return approveByText(messageId, effective, "deny");
+    if (/^cancel\s+/.test(lower)) return approveByText(messageId, effective, "cancel");
+    if (/^answer\s+/.test(lower)) return answerByText(messageId, effective);
+    if (/^(attach|switch|常驻|切换|切换会话)\s*\S+/.test(effective)) return attachThread(ctx, messageId, effective);
+    if (/^(session|会话)\s*\S+/.test(effective)) return showThread(ctx, messageId, effective);
+    if (/^(new session|new chat|新会话|新对话)\s*$/i.test(effective)) {
+      ctx.newSessionPending = true;
+      saveChatContext(ctx);
+      return replyCard(
+        messageId,
+        noticeCard("new session", "blue", "Next normal message will create and attach a new Codex thread.", ""),
+      );
+    }
+    if (/^(new session|new chat|新会话|新对话)\s+/i.test(effective)) {
+      return startTask(ctx, messageId, effective.replace(/^(new session|new chat|新会话|新对话)\s+/i, ""), {
+        forceNew: true,
+        attach: true,
+      });
+    }
+    if (/^(new|新任务)\s+/i.test(effective)) {
+      return startTask(ctx, messageId, effective.replace(/^(new|新任务)\s+/i, ""), {
+        forceNew: true,
+        attach: false,
+      });
+    }
+  }
+  if (ctx.newSessionPending) {
+    ctx.newSessionPending = false;
+    saveChatContext(ctx);
+    return startTask(ctx, messageId, prompt, { forceNew: true, attach: true });
+  }
+  return startTask(ctx, messageId, prompt, { forceNew: false, attach: true });
+}
+
+async function startTask(ctx, sourceMessageId, prompt, options) {
+  let threadId = options.forceNew ? "" : ctx.activeThreadId;
+  let thread = null;
+  if (!threadId) {
+    const created = await state.codex.request("thread/start", threadStartParams(ctx));
+    thread = created.thread;
+    threadId = thread.id;
+    rememberThread(thread);
+    if (options.attach) {
+      ctx.activeThreadId = threadId;
+      saveChatContext(ctx);
+    }
+  } else {
+    await state.codex.request("thread/resume", threadResumeParams(ctx, threadId));
+  }
+
+  const task = makeTask(ctx, sourceMessageId, prompt, threadId);
+  state.runningByThread.set(threadId, task);
+  await createRunningCard(task, "RUNNING", options.forceNew ? "starting new thread..." : "working...");
+
+  const turnParams = turnStartParams(ctx, threadId, prompt);
+  try {
+    const result = await state.codex.request("turn/start", turnParams);
+    task.turnId = result.turn?.id || task.turnId;
+    if (task.turnId) state.tasksByTurn.set(`${threadId}:${task.turnId}`, task);
+  } catch (error) {
+    if (!options.forceNew) {
+      try {
+        const steered = await state.codex.request("turn/steer", {
+          threadId,
+          input: [{ type: "text", text: prompt, text_elements: [] }],
+        });
+        task.turnId = steered.turnId || task.turnId;
+        if (task.turnId) state.tasksByTurn.set(`${threadId}:${task.turnId}`, task);
+        appendTaskOutput(task, "input steered into running turn.");
+        await updateTaskCard(task, "RUNNING", task.output);
+        return;
+      } catch (_) {}
+    }
+    enqueueTask(ctx, sourceMessageId, prompt, options);
+    await updateTaskCard(task, "QUEUED", `queued: ${compact(prompt, 240)}`);
+  }
+}
+
+function threadStartParams(ctx) {
+  return {
+    model: config.model,
+    cwd: ctx.settings.workdir,
+    approvalPolicy: config.approvalPolicy,
+    approvalsReviewer: "user",
+    sandbox: "workspace-write",
+    serviceName: "lark-codex-bridge",
+  };
+}
+
+function threadResumeParams(ctx, threadId) {
+  return {
+    threadId,
+    model: config.model,
+    cwd: ctx.settings.workdir,
+    approvalPolicy: config.approvalPolicy,
+    approvalsReviewer: "user",
+    sandbox: "workspace-write",
+    excludeTurns: true,
+  };
+}
+
+function turnStartParams(ctx, threadId, prompt) {
+  return {
+    threadId,
+    input: [{ type: "text", text: prompt, text_elements: [] }],
+    cwd: ctx.settings.workdir,
+    approvalPolicy: config.approvalPolicy,
+    approvalsReviewer: "user",
+    model: config.model,
+  };
+}
+
+function makeTask(ctx, sourceMessageId, prompt, threadId) {
+  return {
+    id: `${Date.now()}-${safeFsId(sourceMessageId).slice(0, 8)}`,
+    chatId: ctx.chatId,
+    sourceMessageId,
+    cardMessageId: "",
+    prompt,
+    threadId,
+    turnId: "",
+    state: "RUNNING",
+    output: "",
+    debugOutput: "",
+    approvals: [],
+    startedAt: Date.now(),
+    lastPatchAt: 0,
+  };
+}
+
+function taskForTurn(threadId, turnId) {
+  if (threadId && turnId) {
+    const direct = state.tasksByTurn.get(`${threadId}:${turnId}`);
+    if (direct) return direct;
+  }
+  return state.runningByThread.get(threadId);
+}
+
+function appendTaskOutput(task, delta, kind = "main") {
+  if (kind === "debug") {
+    task.debugOutput = truncateTail(`${task.debugOutput || ""}${delta}`, Math.min(config.outputLimit, 24000));
+    return;
+  }
+  task.output = truncateTail(`${task.output}${delta}`, config.outputLimit);
+  const ctx = chatContext(task.chatId);
+  ctx.lastReadableOutput =
+    task.output.trim().split(/\r?\n/).filter(Boolean).slice(-1)[0] || ctx.lastReadableOutput || "";
+  saveChatContext(ctx);
+}
+
+async function createRunningCard(task, cardState, output) {
+  const card = terminalCard(task, cardState, output);
+  const res = await replyCardCapture(task.sourceMessageId, card);
+  task.cardMessageId = res || "";
+  if (!task.cardMessageId) await replyCard(task.sourceMessageId, card);
+}
+
+async function patchTaskCardThrottled(task, cardState) {
+  const now = Date.now();
+  if (now - task.lastPatchAt < 1400) return;
+  task.lastPatchAt = now;
+  await updateTaskCard(task, cardState, task.output || "working...");
+}
+
+async function updateTaskCard(task, cardState, output) {
+  task.state = cardState;
+  const card = terminalCard(task, cardState, output);
+  if (config.terminalRender === "screen" && task.cardMessageId) {
+    const ok = await updateMessage(task.cardMessageId, card);
+    if (ok) return;
+  }
+  await replyCard(task.sourceMessageId, card);
+}
+
+function finishTask(task) {
+  state.runningByThread.delete(task.threadId);
+  if (task.turnId) state.tasksByTurn.delete(`${task.threadId}:${task.turnId}`);
+  const ctx = chatContext(task.chatId);
+  ctx.lastReadableOutput = task.output.trim().split(/\r?\n/).filter(Boolean).slice(-1)[0] || ctx.lastReadableOutput || "";
+  saveChatContext(ctx);
+}
+
+function enqueueTask(ctx, sourceMessageId, prompt, options) {
+  state.queue.push({ chatId: ctx.chatId, sourceMessageId, prompt, options });
+}
+
+function startQueueLoop() {
+  setInterval(drainQueue, 2500).unref();
+}
+
+function drainQueue() {
+  if (state.queue.length === 0) return;
+  const next = state.queue[0];
+  const ctx = chatContext(next.chatId);
+  if (ctx.activeThreadId && state.runningByThread.has(ctx.activeThreadId)) return;
+  state.queue.shift();
+  startTask(ctx, next.sourceMessageId, next.prompt, next.options).catch((error) => {
+    log(`queue-task-error ${error.stack || error.message || error}`);
+  });
+}
+
+async function replyHelp(messageId) {
+  const prefix = config.commandMode === "slash" ? "/" : "";
+  const body = [
+    `\`${prefix}sessions\` list threads`,
+    `\`${prefix}attach 1\` switch current thread`,
+    `\`${prefix}current\` show current thread`,
+    `\`${prefix}new <prompt>\` start isolated thread`,
+    `\`${prefix}new session <prompt>\` start and attach thread`,
+    `\`${prefix}detach\` clear current thread`,
+    `\`${prefix}approve <id>\` / \`${prefix}deny <id>\` text approval fallback`,
+    `\`${prefix}pwd\` / \`${prefix}cd /path\` workdir`,
+    `\`${prefix}status\` / \`${prefix}queue\` / \`${prefix}logs\``,
+  ].join("\n");
+  await replyCard(messageId, noticeCard("terminal help", "blue", body, ""));
+}
+
+async function replyStatus(ctx, messageId) {
+  const active = ctx.activeThreadId ? shortId(ctx.activeThreadId) : "none";
+  const body = [
+    "`backend` app-server",
+    `\`thread\` ${active}`,
+    `\`running\` ${state.runningByThread.size}`,
+    `\`queue\` ${state.queue.length}`,
+    `\`approvals\` ${activeApprovalCount()}`,
+    `\`cwd\` ${ctx.settings.workdir}`,
+  ].join("\n");
+  await replyCard(messageId, noticeCard("status", "blue", body, ""));
+}
+
+async function replyLogs(messageId) {
+  const body = "Logs are written to `~/.lark-codex/bridge.log`.\nUse `tail -f ~/.lark-codex/bridge.log` on the Mac for full detail.";
+  await replyCard(messageId, noticeCard("logs", "blue", body, ""));
+}
+
+async function replyQueue(messageId) {
+  const body = state.queue.length
+    ? state.queue.map((item, index) => `${index + 1}. ${compact(item.prompt, 160)}`).join("\n")
+    : "queue is empty";
+  await replyCard(messageId, noticeCard("queue", "blue", body, ""));
+}
+
+async function replySessions(ctx, messageId) {
+  const result = await state.codex.request("thread/list", {
+    limit: 12,
+    sortKey: "updated_at",
+    sortDirection: "desc",
+    archived: false,
+    sourceKinds: [],
+  });
+  const threads = Array.isArray(result.data) ? result.data : [];
+  ctx.aliases = {};
+  const lines = [];
+  threads.forEach((thread, index) => {
+    const number = String(index + 1);
+    ctx.aliases[number] = thread.id;
+    rememberThread(thread);
+    const current = thread.id === ctx.activeThreadId ? " current" : "";
+    lines.push(`#${number}${current} ${compact(thread.name || thread.preview || shortId(thread.id), 80)} | ${shortPath(thread.cwd || "")}`);
+  });
+  saveChatContext(ctx);
+  const body = lines.length ? lines.join("\n") : "no threads";
+  const detail = ctx.activeThreadId ? `current: ${ctx.activeThreadId}\nlast: ${ctx.lastReadableOutput || ""}` : "";
+  await replyCard(messageId, noticeCard("sessions", "blue", body, detail));
+}
+
+async function replyCurrent(ctx, messageId) {
+  if (!ctx.activeThreadId) {
+    await replyCard(messageId, noticeCard("current", "blue", "no active thread", ""));
+    return;
+  }
+  const last = await lastReadableForThread(ctx.activeThreadId);
+  const body = [`thread: \`${shortId(ctx.activeThreadId)}\``, last || ctx.lastReadableOutput || "no readable output yet"].join("\n\n");
+  await replyCard(messageId, noticeCard("current", "blue", body, `thread_id: ${ctx.activeThreadId}`));
+}
+
+async function detachThread(ctx, messageId) {
+  ctx.activeThreadId = "";
+  saveChatContext(ctx);
+  await replyCard(messageId, noticeCard("detach", "blue", "current thread cleared", ""));
+}
+
+async function changeCwd(ctx, messageId, cwd) {
+  const resolved = expandHome(cwd);
+  if (!path.isAbsolute(resolved)) {
+    await replyCard(messageId, noticeCard("cd", "red", "cwd must be an absolute path", ""));
+    return;
+  }
+  ctx.settings.workdir = resolved;
+  saveChatContext(ctx);
+  await replyCard(messageId, noticeCard("cd", "blue", `cwd set to \`${resolved}\``, ""));
+}
+
+async function attachThread(ctx, messageId, prompt) {
+  const match = prompt.match(/^(attach|switch|常驻|切换|切换会话)\s*(\S+)/i);
+  const ref = match?.[2] || "";
+  const threadId = resolveThreadRef(ctx, ref);
+  if (!threadId) {
+    await replyCard(messageId, noticeCard("attach", "red", `unknown thread: ${ref}`, "send `sessions` first"));
+    return;
+  }
+  await state.codex.request("thread/resume", threadResumeParams(ctx, threadId));
+  ctx.activeThreadId = threadId;
+  const last = await lastReadableForThread(threadId);
+  ctx.lastReadableOutput = last || ctx.lastReadableOutput || "";
+  saveChatContext(ctx);
+  await replyCard(messageId, noticeCard("attached", "green", last || `attached ${shortId(threadId)}`, `thread_id: ${threadId}`));
+}
+
+async function showThread(ctx, messageId, prompt) {
+  const match = prompt.match(/^(session|会话)\s*(\S+)/i);
+  const ref = match?.[2] || "";
+  const threadId = resolveThreadRef(ctx, ref);
+  if (!threadId) {
+    await replyCard(messageId, noticeCard("session", "red", `unknown thread: ${ref}`, "send `sessions` first"));
+    return;
+  }
+  const last = await lastReadableForThread(threadId);
+  await replyCard(messageId, noticeCard("session", "blue", last || "no readable output yet", `thread_id: ${threadId}`));
+}
+
+async function approveByText(messageId, prompt, action) {
+  const parts = prompt.trim().split(/\s+/);
+  const id = parts[1] || "";
+  const mapped = action === "allow" && parts[1] === "session" ? "allow-session" : action;
+  const approvalId = parts[1] === "session" ? parts[2] : id;
+  const result = await resolveApproval(approvalId, mapped);
+  await replyCard(messageId, noticeCard("approval", result.ok ? "green" : "red", result.text, ""));
+}
+
+async function answerByText(messageId, prompt) {
+  const match = prompt.match(/^answer\s+(\S+)\s+([\s\S]+)$/i);
+  if (!match) {
+    await replyCard(messageId, noticeCard("answer", "red", "usage: answer <approval_id> <text>", ""));
+    return;
+  }
+  const approval = findApproval(match[1]);
+  if (!approval || approval.method !== "item/tool/requestUserInput") {
+    await replyCard(messageId, noticeCard("answer", "red", `input request not found: ${match[1]}`, ""));
+    return;
+  }
+  const result = await resolveApproval(match[1], "answer", match[2]);
+  await replyCard(messageId, noticeCard("answer", result.ok ? "green" : "red", result.text, ""));
+}
+
+function chatContext(chatId) {
+  if (state.chats.has(chatId)) return state.chats.get(chatId);
+  const dir = path.join(config.chatsDir, safeFsId(chatId));
+  fs.mkdirSync(dir, { recursive: true });
+  const settingsPath = path.join(dir, "settings.json");
+  const statePath = path.join(dir, "appserver.json");
+  const settings = {
+    workdir: config.defaultWorkdir,
+    outputLimit: config.outputLimit,
+    debug: false,
+    ...(readJson(settingsPath) || {}),
+  };
+  const stored = readJson(statePath) || {};
+  const ctx = {
+    chatId,
+    dir,
+    settingsPath,
+    statePath,
+    settings,
+    activeThreadId: stored.activeThreadId || "",
+    aliases: stored.aliases || {},
+    newSessionPending: Boolean(stored.newSessionPending),
+    lastReadableOutput: stored.lastReadableOutput || "",
+    lastSourceMessageId: stored.lastSourceMessageId || "",
+  };
+  state.chats.set(chatId, ctx);
+  return ctx;
+}
+
+function saveChatContext(ctx) {
+  writeJson(ctx.settingsPath, ctx.settings);
+  writeJson(ctx.statePath, {
+    activeThreadId: ctx.activeThreadId,
+    aliases: ctx.aliases,
+    newSessionPending: ctx.newSessionPending,
+    lastReadableOutput: ctx.lastReadableOutput,
+    lastSourceMessageId: ctx.lastSourceMessageId,
+  });
+}
+
+function findChatByThread(threadId) {
+  for (const ctx of state.chats.values()) {
+    if (ctx.activeThreadId === threadId) return ctx;
+  }
+  return null;
+}
+
+function resolveThreadRef(ctx, ref) {
+  if (!ref) return "";
+  if (ctx.aliases?.[ref]) return ctx.aliases[ref];
+  if (/^[0-9a-f-]{20,}$/i.test(ref)) return ref;
+  const hit = Object.values(ctx.aliases || {}).find((id) => id.startsWith(ref));
+  return hit || "";
+}
+
+async function lastReadableForThread(threadId) {
+  try {
+    const result = await state.codex.request("thread/read", { threadId, includeTurns: true });
+    const thread = result.thread;
+    rememberThread(thread);
+    const lines = [];
+    for (const turn of thread.turns || []) {
+      for (const item of turn.items || []) {
+        if (item.type === "agentMessage" && item.text) lines.push(item.text);
+      }
+    }
+    return compact(lines.filter(Boolean).slice(-1)[0] || "", config.outputLimit);
+  } catch (error) {
+    log(`thread-read failed thread=${threadId} ${error.message || error}`);
+    return "";
+  }
+}
+
+function rememberThread(thread) {
+  if (!thread?.id) return;
+  writeJson(path.join(config.stateDir, `thread-${safeFsId(thread.id)}.json`), {
+    id: thread.id,
+    name: thread.name || "",
+    preview: thread.preview || "",
+    cwd: thread.cwd || "",
+    updatedAt: thread.updatedAt || 0,
+  });
+}
+
+function approvalSummaryText(approval) {
+  const p = approval?.params || {};
+  const reason = (p.reason || "").trim();
+  const prefix = reason || "Approval required";
+  if (p.command) {
+    const cmd = Array.isArray(p.command) ? p.command.join(" ") : String(p.command);
+    return `${prefix}\n${compact(cmd, 1800)}`;
+  }
+  if (approval?.method?.includes("fileChange")) return `${prefix}\n(file changes)`;
+  if (approval?.method?.includes("permissions")) return `${prefix}\n(permissions)`;
+  if (approval?.method?.includes("requestUserInput")) return `${prefix}\n(user input)`;
+  return prefix;
+}
+
+function terminalCard(task, cardState, output) {
+  const elapsed = Math.max(0, Math.floor((Date.now() - task.startedAt) / 1000));
+  let rendered = mobileCodeText(truncateTail(output || "working...", Math.max(500, config.cardBodyLimit - 80)));
+  if (cardState === "WAITING" && task.approvals?.length) {
+    const summary = mobileCodeText(approvalSummaryText(task.approvals[0]));
+    rendered = rendered ? `${rendered}\n\n${summary}` : summary;
+  }
+  // Keep the main view focused on readable output. Status/meta goes into the
+  // collapsible detail panel instead of polluting the "terminal" stream.
+  const body = ["```text", rendered.replace(/```/g, "`\u200b``"), "```"].join("\n");
+  const detailLines = [
+    `state: ${cardState}`,
+    `elapsed: ${elapsed}s`,
+    `queue: ${state.queue.length}`,
+    `cwd: ${shortPath(chatContext(task.chatId).settings.workdir)}`,
+    `task_id: ${task.id}`,
+    `thread_id: ${task.threadId}`,
+    task.turnId ? `turn_id: ${task.turnId}` : "",
+    `prompt: ${compact(task.prompt, 500)}`,
+  ].filter(Boolean);
+  if (task.debugOutput) {
+    detailLines.push("");
+    detailLines.push("tool_output:");
+    detailLines.push("```text");
+    detailLines.push(truncateTail(task.debugOutput, 1800).replace(/```/g, "`\u200b``"));
+    detailLines.push("```");
+  }
+  const detail = detailLines.join("\n");
+  return cardJson(`${cardState} Codex`, templateForState(cardState), body, detail, approvalElements(task));
+}
+
+function approvalCard(approval, task) {
+  const body = approvalBody(approval);
+  const detail = [
+    `approval_id: ${approval.id}`,
+    `method: ${approval.method}`,
+    approval.threadId ? `thread_id: ${approval.threadId}` : "",
+    approval.itemId ? `item_id: ${approval.itemId}` : "",
+    "fallback: approve <id> / deny <id>",
+  ].filter(Boolean).join("\n");
+  return cardJson("WAITING Approval", "yellow", body, detail, approvalElements(task, [approval]));
+}
+
+function approvalElements(task, approvals = task?.approvals || []) {
+  if (!approvals.length || config.approvalUi === "text") return [];
+  const buttons = [];
+  for (const approval of approvals) buttons.push(...approvalButtons(approval));
+  if (!buttons.length) return [];
+
+  const elements = [{ tag: "hr" }];
+  const rowSize = config.mobileLayout ? 2 : 4;
+  for (let i = 0; i < buttons.length; i += rowSize) {
+    const row = buttons.slice(i, i + rowSize);
+    elements.push({
+      tag: "column_set",
+      horizontal_spacing: "8px",
+      columns: row.map((btn) => ({
+        tag: "column",
+        width: "auto",
+        elements: [btn],
+      })),
+    });
+  }
+  return elements;
+}
+
+function approvalButtons(approval) {
+  if (approval.method === "item/tool/requestUserInput") {
+    const questions = Array.isArray(approval.params.questions) ? approval.params.questions : [];
+    const buttons = [];
+    for (const question of questions) {
+      for (const option of question.options || []) {
+        buttons.push(button(option.label, "primary_filled", approvalValue(approval, "answer", option.label)));
+      }
+    }
+    buttons.push(button("Deny", "danger_filled", approvalValue(approval, "deny")));
+    return buttons.slice(0, 6);
+  }
+  const buttons = [button("Allow once", "primary_filled", approvalValue(approval, "allow"))];
+  if (config.approvalAllowSession && !approval.method.includes("permissions")) {
+    buttons.push(button("Allow session", "default", approvalValue(approval, "allow-session")));
+  }
+  if (approval.method.includes("permissions")) {
+    buttons.push(button("Allow session", "default", approvalValue(approval, "allow-session")));
+  }
+  buttons.push(button("Deny", "danger_filled", approvalValue(approval, "deny")));
+  buttons.push(button("Cancel", "default", approvalValue(approval, "cancel")));
+  return buttons;
+}
+
+function approvalValue(approval, action, answer = "") {
+  return {
+    bridge: "lark-codex-bridge",
+    kind: "approval",
+    approval_id: approval.id,
+    thread_id: approval.threadId,
+    turn_id: approval.turnId,
+    item_id: approval.itemId,
+    chat_id: approval.chatId,
+    action,
+    answer,
+    nonce: approval.nonce,
+  };
+}
+
+function button(text, type, value) {
+  return {
+    tag: "button",
+    text: { tag: "plain_text", content: text },
+    type,
+    size: config.mobileLayout ? "small" : "medium",
+    behaviors: [{ type: "callback", value }],
+  };
+}
+
+function approvalBody(approval) {
+  const p = approval.params || {};
+  if (approval.method.includes("command") || approval.method === "execCommandApproval") {
+    const cmd = p.command ? (Array.isArray(p.command) ? p.command.join(" ") : p.command) : "command approval requested";
+    return `Approval required:\n\n\`\`\`text\n${mobileCodeText(compact(cmd, 1800))}\n\`\`\``;
+  }
+  if (approval.method.includes("fileChange") || approval.method === "applyPatchApproval") {
+    return `File change approval required.\n\n${p.reason || p.grantRoot || "Review the requested write before allowing."}`;
+  }
+  if (approval.method.includes("permissions")) {
+    return `Permission approval required.\n\n${p.reason || stringifyCompact(p.permissions)}`;
+  }
+  if (approval.method.includes("requestUserInput")) {
+    const questions = (p.questions || []).map((q) => `**${q.header || q.id}**\n${q.question}`).join("\n\n");
+    return questions || "Codex requests input.";
+  }
+  return "Approval required.";
+}
+
+function noticeCard(title, template, body, detail) {
+  return cardJson(title, template, body, detail, []);
+}
+
+function cardJson(title, template, body, detail, extraElements = []) {
+  const elements = [{ tag: "markdown", content: truncateTail(body, config.cardBodyLimit) }];
+  if (extraElements.length) elements.push(...extraElements);
+  if (detail) {
+    elements.push({
+      tag: "collapsible_panel",
+      expanded: false,
+      header: {
+        title: { tag: "plain_text", content: "details" },
+        vertical_align: "center",
+        icon: { tag: "standard_icon", token: "down-small-ccm_outlined", color: "", size: "16px 16px" },
+        icon_position: "right",
+        icon_expanded_angle: -180,
+      },
+      elements: [{ tag: "markdown", content: truncateTail(detail, config.cardDetailLimit) }],
+    });
+  }
+  return {
+    schema: "2.0",
+    config: { wide_screen_mode: !config.mobileLayout, enable_forward: false, update_multi: true },
+    header: { template, title: { tag: "plain_text", content: title } },
+    body: { elements },
+  };
+}
+
+async function refreshTenantToken() {
+  if (state.token && Date.now() < state.tokenExpiresAt - 60_000) return state.token;
+  const res = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ app_id: config.appId, app_secret: config.appSecret }),
+  });
+  const json = await res.json();
+  if (!json.tenant_access_token) throw new Error(`tenant token failed: ${JSON.stringify(json)}`);
+  state.token = json.tenant_access_token;
+  state.tokenExpiresAt = Date.now() + (json.expire || 7200) * 1000;
+  process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN = state.token;
+  return state.token;
+}
+
+async function larkApi(method, apiPath, body) {
+  const token = await refreshTenantToken();
+  const res = await fetch(`https://open.feishu.cn/open-apis${apiPath}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || (json.code !== undefined && json.code !== 0)) {
+    log(`lark-api-failed ${method} ${apiPath} ${JSON.stringify(json).slice(0, 600)}`);
+    return null;
+  }
+  return json;
+}
+
+async function replyText(messageId, text) {
+  return larkApi("POST", `/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
+    msg_type: "text",
+    content: JSON.stringify({ text: truncateTail(text, config.outputLimit) }),
+  });
+}
+
+async function replyCard(messageId, card) {
+  const res = await larkApi("POST", `/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
+    msg_type: "interactive",
+    content: JSON.stringify(card),
+  });
+  if (!res) await replyText(messageId, fallbackText(card));
+  return res;
+}
+
+async function replyCardCapture(messageId, card) {
+  const res = await larkApi("POST", `/im/v1/messages/${encodeURIComponent(messageId)}/reply`, {
+    msg_type: "interactive",
+    content: JSON.stringify(card),
+  });
+  return res?.data?.message_id || res?.data?.message?.message_id || "";
+}
+
+async function updateMessage(messageId, card) {
+  if (!config.enableMessageUpdate && config.terminalRender !== "screen") return false;
+  const body = { msg_type: "interactive", content: JSON.stringify(card) };
+  // Updating card content is supported via PATCH (message card patch API).
+  // Avoid PUT: it maps to "edit message" and frequently rejects card msg_type.
+  return Boolean(await larkApi("PATCH", `/im/v1/messages/${encodeURIComponent(messageId)}`, body));
+}
+
+async function addReaction(messageId, emojiType = config.ackReactionEmoji) {
+  if (!messageId) return false;
+  const res = await larkApi("POST", `/im/v1/messages/${encodeURIComponent(messageId)}/reactions`, {
+    reaction_type: { emoji_type: emojiType },
+  });
+  return Boolean(res);
+}
+
+async function ackMessage(messageId) {
+  if (config.ackMode === "text") return replyText(messageId, config.ackEmoji);
+  if (config.ackMode === "both") {
+    await addReaction(messageId).catch(() => false);
+    return replyText(messageId, config.ackEmoji);
+  }
+  const ok = await addReaction(messageId).catch(() => false);
+  if (!ok) await replyText(messageId, config.ackEmoji);
+}
+
+function fallbackText(card) {
+  const title = card?.header?.title?.content || "Codex";
+  const md = card?.body?.elements?.find((el) => el.tag === "markdown")?.content || "";
+  return `${title}\n\n${md.replace(/```text\n?/g, "").replace(/```/g, "")}`;
+}
+
+function activeApprovalCount() {
+  let count = 0;
+  for (const approval of state.pendingApprovals.values()) {
+    if (!approval.resolved && Date.now() < approval.expiresAt) count += 1;
+  }
+  return count;
+}
+
+function findApproval(ref) {
+  if (!ref) return null;
+  if (state.pendingApprovals.has(ref)) return state.pendingApprovals.get(ref);
+  for (const approval of state.pendingApprovals.values()) {
+    if (approval.id.startsWith(ref)) return approval;
+  }
+  return null;
+}
+
+function templateForState(cardState) {
+  if (cardState === "DONE") return "green";
+  if (cardState === "FAILED") return "red";
+  if (cardState === "WAITING" || cardState === "QUEUED") return "yellow";
+  return "blue";
+}
+
+function extractText(content) {
+  if (!content) return "";
+  if (typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    return JSON.stringify(content);
+  }
+  const parsed = safeJson(content);
+  if (parsed && typeof parsed.text === "string") return parsed.text;
+  return String(content);
+}
+
+function normalizePrompt(text) {
+  return String(text || "")
+    .replace(/^\/codex\s*/i, "")
+    .replace(/@\S+/g, "")
+    .trim();
+}
+
+function expandHome(value) {
+  return String(value || "")
+    .replace(/^\$HOME(?=\/|$)/, os.homedir())
+    .replace(/\$\{HOME\}/g, os.homedir())
+    .replace(/^~(?=\/|$)/, os.homedir());
+}
+
+function intValue(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function stringBool(value, fallback) {
+  if (value === undefined || value === "") return fallback;
+  return /^(1|true|yes|on)$/i.test(String(value));
+}
+
+function oneOf(value, allowed, fallback) {
+  return allowed.includes(value) ? value : fallback;
+}
+
+function safeFsId(input) {
+  return crypto.createHash("sha256").update(String(input)).digest("hex").slice(0, 32);
+}
+
+function shortNonce() {
+  return crypto.randomBytes(6).toString("hex");
+}
+
+function shortId(id) {
+  if (!id) return "";
+  return id.length <= 16 ? id : `${id.slice(0, 8)}...${id.slice(-6)}`;
+}
+
+function shortPath(value) {
+  const text = String(value || "");
+  return text.replace(os.homedir(), "~");
+}
+
+function compact(text, max) {
+  return String(text || "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function truncateTail(text, max) {
+  const value = String(text || "");
+  if (value.length <= max) return value;
+  return `[output truncated]\n${value.slice(value.length - max)}`;
+}
+
+function mobileCodeText(text) {
+  const value = String(text || "").replace(/```/g, "`\u200b``");
+  if (!config.mobileLayout) return value;
+  const width = Math.max(40, config.mobileLineChars || 88);
+  return value
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      if (line.length <= width) return [line];
+      const chunks = [];
+      for (let i = 0; i < line.length; i += width) chunks.push(line.slice(i, i + width));
+      return chunks;
+    })
+    .join("\n");
+}
+
+function stringifyCompact(value) {
+  return JSON.stringify(value, null, 2).slice(0, 2000);
+}
+
+function safeJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch (_) {
+    return null;
+  }
+}
+
+function readText(file) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch (_) {
+    return "";
+  }
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function log(message) {
+  console.error(`[${new Date().toISOString()}] ${message}`);
+}
+
+function runSelfTest() {
+  const approval = {
+    id: "abc123",
+    requestId: 1,
+    method: "item/commandExecution/requestApproval",
+    params: { command: "git status", cwd: "/tmp" },
+    threadId: "019ded2c-d3c3-7eb0-b57b-b919780f16b8",
+    turnId: "turn1",
+    itemId: "item1",
+    chatId: "chat1",
+    sourceMessageId: "msg1",
+    nonce: "nonce1",
+    expiresAt: Date.now() + 60000,
+    resolved: false,
+  };
+  const task = {
+    id: "task1",
+    chatId: "chat1",
+    sourceMessageId: "msg1",
+    cardMessageId: "card1",
+    prompt: "test prompt",
+    threadId: approval.threadId,
+    turnId: approval.turnId,
+    state: "WAITING",
+    output: "working...",
+    approvals: [approval],
+    startedAt: Date.now(),
+  };
+  state.chats.set("chat1", {
+    chatId: "chat1",
+    settings: { workdir: "/tmp", outputLimit: 12000, debug: false },
+    aliases: {},
+    activeThreadId: approval.threadId,
+    lastReadableOutput: "",
+  });
+  const card = terminalCard(task, "WAITING", "working...");
+  const commandResponse = responseForApproval(approval, "allow");
+  const sessionResponse = responseForApproval(approval, "allow-session");
+  const denyResponse = responseForApproval(approval, "deny");
+  if (slashCommandLine("/切换2") !== "切换 2") throw new Error("slash compact switch parse failed");
+  if (slashCommandLine("/sessions") !== "sessions") throw new Error("slash sessions parse failed");
+  if (slashCommandLine("sessions") !== "") throw new Error("plain command should not parse as slash command");
+  JSON.parse(JSON.stringify(card));
+  JSON.parse(JSON.stringify(commandResponse));
+  JSON.parse(JSON.stringify(sessionResponse));
+  JSON.parse(JSON.stringify(denyResponse));
+  console.log(JSON.stringify({ ok: true, card, commandResponse, sessionResponse, denyResponse }));
+}
+
+if (RUN_SELF_TEST) {
+  runSelfTest();
+  process.exit(0);
+}
+
+main().catch((error) => {
+  log(`fatal ${error.stack || error.message || error}`);
+  process.exit(1);
+});

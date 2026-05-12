@@ -32,6 +32,13 @@ if (screen -ls 2>/dev/null || true) | grep -q "[.]$SCREEN_NAME[[:space:]]"; then
   exit 0
 fi
 
-screen -dmS "$SCREEN_NAME" "$ROOT_DIR/bin/lark-codex-bridge"
+# On macOS, `screen` typically launches the command via `login -pflq ...`,
+# which may drop custom environment variables. Pass critical config via `env`
+# so the bridge always picks up the right `.env` / state dir.
+screen -dmS "$SCREEN_NAME" env \
+  LARK_CODEX_BASE_DIR="$CONFIG_DIR" \
+  LARK_CODEX_CREDENTIALS="$ENV_FILE" \
+  LARK_CODEX_STATE_DIR="$STATE_DIR" \
+  "$ROOT_DIR/bin/lark-codex-bridge"
 echo "Started screen session: $SCREEN_NAME"
 echo "View logs: tail -f ${LARK_CODEX_LOG_FILE:-$CONFIG_DIR/bridge.log}"

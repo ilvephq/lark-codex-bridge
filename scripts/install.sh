@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_DIR="${LARK_CODEX_BASE_DIR:-$HOME/.lark-codex}"
 ENV_FILE="${LARK_CODEX_CREDENTIALS:-$CONFIG_DIR/.env}"
 
-required_commands=(bash jq curl sqlite3 lark-cli codex screen)
+required_commands=(bash jq curl sqlite3 lark-cli codex screen node)
 missing=()
 
 for cmd in "${required_commands[@]}"; do
@@ -30,7 +30,11 @@ else
   echo "Created config template: $ENV_FILE"
 fi
 
-chmod +x "$ROOT_DIR/bin/lark-codex-bridge" "$ROOT_DIR/scripts/start-screen.sh" "$ROOT_DIR/scripts/stop-screen.sh"
+chmod +x \
+  "$ROOT_DIR/bin/lark-codex-bridge" \
+  "$ROOT_DIR/bin/lark-codex-bridge-appserver" \
+  "$ROOT_DIR/scripts/start-screen.sh" \
+  "$ROOT_DIR/scripts/stop-screen.sh"
 
 echo
 echo "Next steps:"

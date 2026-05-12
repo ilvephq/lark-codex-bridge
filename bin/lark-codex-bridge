@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${LARK_CODEX_BASE_DIR:-$HOME/.lark-codex}"
 CRED_FILE="${LARK_CODEX_CREDENTIALS:-$BASE_DIR/.env}"
 CODEX_WORKDIR="${LARK_CODEX_WORKDIR:-$HOME}"
 COMMAND_PREFIX="${LARK_CODEX_COMMAND_PREFIX:-/codex}"
+COMMAND_MODE="${LARK_CODEX_COMMAND_MODE:-slash}"
 ALLOWED_SENDER="${LARK_CODEX_ALLOWED_SENDER:-}"
 MAX_REPLY_CHARS="${LARK_CODEX_MAX_REPLY_CHARS:-12000}"
 OUTPUT_LIMIT_CHARS_DEFAULT="${LARK_CODEX_OUTPUT_LIMIT_CHARS:-$MAX_REPLY_CHARS}"
@@ -23,6 +25,10 @@ RESULT_FORMAT="${LARK_CODEX_RESULT_FORMAT:-card}"
 DIRECTORY_FORMAT="${LARK_CODEX_DIRECTORY_FORMAT:-card}"
 OUTPUT_STYLE="${LARK_CODEX_OUTPUT_STYLE:-compact}"
 CARD_SCHEMA="${LARK_CODEX_CARD_SCHEMA:-2}"
+CARD_MOBILE_LAYOUT="${LARK_CODEX_CARD_MOBILE_LAYOUT:-true}"
+CARD_BODY_LIMIT_CHARS="${LARK_CODEX_CARD_BODY_LIMIT_CHARS:-4000}"
+CARD_DETAIL_LIMIT_CHARS="${LARK_CODEX_CARD_DETAIL_LIMIT_CHARS:-2000}"
+CARD_MOBILE_LINE_CHARS="${LARK_CODEX_CARD_MOBILE_LINE_CHARS:-88}"
 SYNC_RENDER_DEFAULT="${LARK_CODEX_SYNC_RENDER:-stream}"
 ENABLE_MESSAGE_UPDATE_DEFAULT="${LARK_CODEX_ENABLE_MESSAGE_UPDATE:-false}"
 STATE_DIR="${LARK_CODEX_STATE_DIR:-$BASE_DIR/state}"
@@ -38,6 +44,13 @@ DIRECTORY_LIMIT="${LARK_CODEX_DIRECTORY_LIMIT:-12}"
 CODEX_SESSIONS_ROOT="${LARK_CODEX_SESSIONS_ROOT:-$HOME/.codex/sessions}"
 CODEX_STATE_DB="${LARK_CODEX_STATE_DB:-$HOME/.codex/state_5.sqlite}"
 LARK_CODEX_DANGEROUS_BYPASS="${LARK_CODEX_DANGEROUS_BYPASS:-false}"
+LARK_CODEX_BACKEND="${LARK_CODEX_BACKEND:-auto}"
+LARK_CODEX_APP_SERVER_LISTEN="${LARK_CODEX_APP_SERVER_LISTEN:-stdio://}"
+LARK_CODEX_APPROVAL_UI="${LARK_CODEX_APPROVAL_UI:-buttons}"
+LARK_CODEX_APPROVAL_TIMEOUT_SECONDS="${LARK_CODEX_APPROVAL_TIMEOUT_SECONDS:-600}"
+LARK_CODEX_APPROVAL_ALLOW_SESSION="${LARK_CODEX_APPROVAL_ALLOW_SESSION:-true}"
+LARK_CODEX_APPROVAL_POLICY="${LARK_CODEX_APPROVAL_POLICY:-on-request}"
+APP_SERVER_HELPER="${LARK_CODEX_APP_SERVER_HELPER:-$SCRIPT_DIR/lark-codex-bridge-appserver}"
 
 CHATS_DIR="$STATE_DIR/chats"
 CHAT_ID=""
@@ -69,9 +82,20 @@ SYNC_SCREEN_MAX_LINES="${LARK_CODEX_SYNC_SCREEN_MAX_LINES:-180}"
 if [[ "$OUTPUT_STYLE" != "compact" && "$OUTPUT_STYLE" != "verbose" ]]; then
   OUTPUT_STYLE="compact"
 fi
+case "$CARD_MOBILE_LAYOUT" in
+  1|true|TRUE|yes|YES|on|ON) CARD_MOBILE_LAYOUT="true" ;;
+  *) CARD_MOBILE_LAYOUT="false" ;;
+esac
+[[ "$CARD_BODY_LIMIT_CHARS" =~ ^[0-9]+$ ]] || CARD_BODY_LIMIT_CHARS="$MAX_REPLY_CHARS"
+[[ "$CARD_DETAIL_LIMIT_CHARS" =~ ^[0-9]+$ ]] || CARD_DETAIL_LIMIT_CHARS=4000
+[[ "$CARD_MOBILE_LINE_CHARS" =~ ^[0-9]+$ ]] || CARD_MOBILE_LINE_CHARS=88
 case "$TASK_MODE" in
   auto-long|explicit-long) ;;
   *) TASK_MODE="auto-long" ;;
+esac
+case "$COMMAND_MODE" in
+  slash|both|legacy) ;;
+  *) COMMAND_MODE="slash" ;;
 esac
 case "$TERMINAL_RENDER" in
   screen|stream) ;;
@@ -109,6 +133,7 @@ source "$CRED_FILE"
 # `config.example.env` actually take effect.
 CODEX_WORKDIR="${LARK_CODEX_WORKDIR:-$CODEX_WORKDIR}"
 COMMAND_PREFIX="${LARK_CODEX_COMMAND_PREFIX:-$COMMAND_PREFIX}"
+COMMAND_MODE="${LARK_CODEX_COMMAND_MODE:-$COMMAND_MODE}"
 ALLOWED_SENDER="${LARK_CODEX_ALLOWED_SENDER:-$ALLOWED_SENDER}"
 MAX_REPLY_CHARS="${LARK_CODEX_MAX_REPLY_CHARS:-$MAX_REPLY_CHARS}"
 OUTPUT_LIMIT_CHARS_DEFAULT="${LARK_CODEX_OUTPUT_LIMIT_CHARS:-$MAX_REPLY_CHARS}"
@@ -127,6 +152,10 @@ RESULT_FORMAT="${LARK_CODEX_RESULT_FORMAT:-$RESULT_FORMAT}"
 DIRECTORY_FORMAT="${LARK_CODEX_DIRECTORY_FORMAT:-$DIRECTORY_FORMAT}"
 OUTPUT_STYLE="${LARK_CODEX_OUTPUT_STYLE:-$OUTPUT_STYLE}"
 CARD_SCHEMA="${LARK_CODEX_CARD_SCHEMA:-$CARD_SCHEMA}"
+CARD_MOBILE_LAYOUT="${LARK_CODEX_CARD_MOBILE_LAYOUT:-$CARD_MOBILE_LAYOUT}"
+CARD_BODY_LIMIT_CHARS="${LARK_CODEX_CARD_BODY_LIMIT_CHARS:-$CARD_BODY_LIMIT_CHARS}"
+CARD_DETAIL_LIMIT_CHARS="${LARK_CODEX_CARD_DETAIL_LIMIT_CHARS:-$CARD_DETAIL_LIMIT_CHARS}"
+CARD_MOBILE_LINE_CHARS="${LARK_CODEX_CARD_MOBILE_LINE_CHARS:-$CARD_MOBILE_LINE_CHARS}"
 SYNC_RENDER_DEFAULT="${LARK_CODEX_SYNC_RENDER:-$SYNC_RENDER_DEFAULT}"
 ENABLE_MESSAGE_UPDATE_DEFAULT="${LARK_CODEX_ENABLE_MESSAGE_UPDATE:-$ENABLE_MESSAGE_UPDATE_DEFAULT}"
 STATE_DIR="${LARK_CODEX_STATE_DIR:-$STATE_DIR}"
@@ -138,6 +167,13 @@ CODEX_SESSIONS_ROOT="${LARK_CODEX_SESSIONS_ROOT:-$CODEX_SESSIONS_ROOT}"
 CODEX_STATE_DB="${LARK_CODEX_STATE_DB:-$CODEX_STATE_DB}"
 LARK_CODEX_DANGEROUS_BYPASS="${LARK_CODEX_DANGEROUS_BYPASS:-$LARK_CODEX_DANGEROUS_BYPASS}"
 SYNC_SCREEN_MAX_LINES="${LARK_CODEX_SYNC_SCREEN_MAX_LINES:-$SYNC_SCREEN_MAX_LINES}"
+LARK_CODEX_BACKEND="${LARK_CODEX_BACKEND:-$LARK_CODEX_BACKEND}"
+LARK_CODEX_APP_SERVER_LISTEN="${LARK_CODEX_APP_SERVER_LISTEN:-$LARK_CODEX_APP_SERVER_LISTEN}"
+LARK_CODEX_APPROVAL_UI="${LARK_CODEX_APPROVAL_UI:-$LARK_CODEX_APPROVAL_UI}"
+LARK_CODEX_APPROVAL_TIMEOUT_SECONDS="${LARK_CODEX_APPROVAL_TIMEOUT_SECONDS:-$LARK_CODEX_APPROVAL_TIMEOUT_SECONDS}"
+LARK_CODEX_APPROVAL_ALLOW_SESSION="${LARK_CODEX_APPROVAL_ALLOW_SESSION:-$LARK_CODEX_APPROVAL_ALLOW_SESSION}"
+LARK_CODEX_APPROVAL_POLICY="${LARK_CODEX_APPROVAL_POLICY:-$LARK_CODEX_APPROVAL_POLICY}"
+APP_SERVER_HELPER="${LARK_CODEX_APP_SERVER_HELPER:-$APP_SERVER_HELPER}"
 
 # Derived paths that depend on STATE_DIR.
 LOCK_DIR="$STATE_DIR/running.lock"
@@ -150,9 +186,20 @@ BRIDGE_LOCK_PID_FILE="$BRIDGE_LOCK_DIR/pid"
 if [[ "$OUTPUT_STYLE" != "compact" && "$OUTPUT_STYLE" != "verbose" ]]; then
   OUTPUT_STYLE="compact"
 fi
+case "$CARD_MOBILE_LAYOUT" in
+  1|true|TRUE|yes|YES|on|ON) CARD_MOBILE_LAYOUT="true" ;;
+  *) CARD_MOBILE_LAYOUT="false" ;;
+esac
+[[ "$CARD_BODY_LIMIT_CHARS" =~ ^[0-9]+$ ]] || CARD_BODY_LIMIT_CHARS="$MAX_REPLY_CHARS"
+[[ "$CARD_DETAIL_LIMIT_CHARS" =~ ^[0-9]+$ ]] || CARD_DETAIL_LIMIT_CHARS=4000
+[[ "$CARD_MOBILE_LINE_CHARS" =~ ^[0-9]+$ ]] || CARD_MOBILE_LINE_CHARS=88
 case "$TASK_MODE" in
   auto-long|explicit-long) ;;
   *) TASK_MODE="auto-long" ;;
+esac
+case "$COMMAND_MODE" in
+  slash|both|legacy) ;;
+  *) COMMAND_MODE="slash" ;;
 esac
 case "$TERMINAL_RENDER" in
   screen|stream) ;;
@@ -173,6 +220,17 @@ fi
 if ((CODEX_LONG_TASK_TIMEOUT_SECONDS < CODEX_TASK_TIMEOUT_SECONDS)); then
   CODEX_LONG_TASK_TIMEOUT_SECONDS="$CODEX_TASK_TIMEOUT_SECONDS"
 fi
+case "$LARK_CODEX_BACKEND" in
+  auto|app-server|exec) ;;
+  *) LARK_CODEX_BACKEND="auto" ;;
+esac
+case "$LARK_CODEX_APPROVAL_UI" in
+  buttons|text|both) ;;
+  *) LARK_CODEX_APPROVAL_UI="buttons" ;;
+esac
+if [[ ! "$LARK_CODEX_APPROVAL_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+  LARK_CODEX_APPROVAL_TIMEOUT_SECONDS=600
+fi
 
 mkdir -p "$(dirname "$LOG_FILE")"
 mkdir -p "$STATE_DIR"
@@ -189,6 +247,26 @@ fi
 export LARKSUITE_CLI_APP_ID LARKSUITE_CLI_APP_SECRET
 export FEISHU_APP_ID="${FEISHU_APP_ID:-$LARKSUITE_CLI_APP_ID}"
 export FEISHU_APP_SECRET="${FEISHU_APP_SECRET:-$LARKSUITE_CLI_APP_SECRET}"
+
+app_server_available() {
+  command -v node >/dev/null 2>&1 &&
+    [[ -x "$APP_SERVER_HELPER" ]] &&
+    "$CODEX_BIN" app-server --help >/dev/null 2>&1
+}
+
+if [[ "$LARK_CODEX_BACKEND" == "app-server" ]]; then
+  if ! app_server_available; then
+    echo "LARK_CODEX_BACKEND=app-server requested, but node, codex app-server, or $APP_SERVER_HELPER is unavailable." >&2
+    exit 1
+  fi
+  echo "$(timestamp) backend=app-server helper=$APP_SERVER_HELPER" >&2
+  exec node "$APP_SERVER_HELPER"
+elif [[ "$LARK_CODEX_BACKEND" == "auto" ]] && app_server_available; then
+  echo "$(timestamp) backend=app-server helper=$APP_SERVER_HELPER" >&2
+  exec node "$APP_SERVER_HELPER"
+else
+  echo "$(timestamp) backend=exec" >&2
+fi
 
 refresh_tenant_token() {
   local response token
@@ -429,6 +507,45 @@ normalize_prompt() {
   printf '%s' "$prompt"
 }
 
+slash_command_line() {
+  local prompt="$1"
+  local raw first lower_first verb ref rest
+
+  [[ "$prompt" == /* ]] || return 1
+  raw="${prompt#/}"
+  raw="$(printf '%s' "$raw" | trim_ws)"
+  [[ -n "$raw" ]] || { printf '%s' "help"; return 0; }
+
+  # Support compact forms like "/切换2" or "/attach1 10分钟".
+  if [[ "$raw" =~ ^(切换|常驻|attach|switch)[[:space:]]*([0-9]+)(.*)$ ]]; then
+    verb="${BASH_REMATCH[1]}"
+    ref="${BASH_REMATCH[2]}"
+    rest="$(printf '%s' "${BASH_REMATCH[3]}" | trim_ws)"
+    if [[ -n "$rest" ]]; then
+      printf '%s' "$verb $ref $rest"
+    else
+      printf '%s' "$verb $ref"
+    fi
+    return 0
+  fi
+
+  first="${raw%%[[:space:]]*}"
+  lower_first="$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')"
+  case "$first" in
+    help|帮助|status|状态|logs|日志|queue|队列|目录|会话目录|sessions|"session list"|current|当前会话|detach|清除会话|取消会话|pwd|cd|cwd|debug|syncmode|同步模式|update|更新|tasks|jobs|任务|task|job|continue|resume|继续任务|长任务|long|新会话|新对话|new|新任务|会话|session|置顶|pin|取消置顶|unpin|停止同步|sync|同步|同步会话)
+      printf '%s' "$raw"
+      return 0
+      ;;
+    attach|switch)
+      # Lowercase-only commands; accept "/Attach" as well.
+      printf '%s' "$lower_first${raw#"$first"}"
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
 reply_text() {
   local message_id="$1"
   local text="$2"
@@ -482,13 +599,11 @@ update_interactive_message() {
   local card_json="$2"
 
   refresh_tenant_token
-  # Prefer PATCH; fall back to PUT for older tenants/endpoints.
+  # PATCH is the supported "update message card" API. Avoid PUT: it maps to
+  # "edit message" and can reject interactive cards with invalid msg_type errors.
   lark-cli api patch "/im/v1/messages/$target_message_id" \
     --data "$(jq -n --arg msg_type "interactive" --arg content "$card_json" '{msg_type:$msg_type, content:$content}')" \
-    --as bot >/dev/null </dev/null ||
-    lark-cli api put "/im/v1/messages/$target_message_id" \
-      --data "$(jq -n --arg msg_type "interactive" --arg content "$card_json" '{msg_type:$msg_type, content:$content}')" \
-      --as bot >/dev/null </dev/null
+    --as bot >/dev/null </dev/null
 }
 
 add_reaction() {
@@ -538,15 +653,18 @@ card_json_v1() {
   local template="$2"
   local body="$3"
   local footer="${4:-发送 status / logs 查看桥接状态}"
+  local wide_screen
 
   body="$(truncate_reply_text "$body" "$MAX_REPLY_CHARS")"
+  [[ "$CARD_MOBILE_LAYOUT" == "true" ]] && wide_screen=false || wide_screen=true
   jq -n \
     --arg title "$title" \
     --arg template "$template" \
     --arg body "$body" \
     --arg footer "$footer" \
+    --argjson wide_screen "$wide_screen" \
     '{
-      config: {wide_screen_mode: true},
+      config: {wide_screen_mode: $wide_screen},
       header: {
         template: $template,
         title: {tag: "plain_text", content: $title}
@@ -564,19 +682,22 @@ card_json_v2() {
   local template="$2"
   local body="$3"
   local detail="${4:-}"
+  local wide_screen
 
-  body="$(truncate_reply_text "$body")"
-  detail="$(truncate_reply_text "$detail")"
+  body="$(truncate_reply_text "$body" "$CARD_BODY_LIMIT_CHARS")"
+  detail="$(truncate_reply_text "$detail" "$CARD_DETAIL_LIMIT_CHARS")"
+  [[ "$CARD_MOBILE_LAYOUT" == "true" ]] && wide_screen=false || wide_screen=true
 
   jq -n \
     --arg title "$title" \
     --arg template "$template" \
     --arg body "$body" \
     --arg detail "$detail" \
+    --argjson wide_screen "$wide_screen" \
     '{
       schema: "2.0",
       config: {
-        wide_screen_mode: true,
+        wide_screen_mode: $wide_screen,
         enable_forward: false,
         update_multi: true
       },
@@ -857,6 +978,28 @@ terminal_safe_fence_text() {
   perl -CS -Mutf8 -0pe 's/```/`\x{200b}``/g'
 }
 
+terminal_mobile_code_text() {
+  if [[ "$CARD_MOBILE_LAYOUT" != "true" ]]; then
+    terminal_safe_fence_text
+    return
+  fi
+  LARK_CODEX_CARD_MOBILE_LINE_CHARS="$CARD_MOBILE_LINE_CHARS" \
+    perl -CS -Mutf8 -Mopen=:std,:encoding\(UTF-8\) -e '
+      my $w = $ENV{LARK_CODEX_CARD_MOBILE_LINE_CHARS} || 88;
+      $w = 40 if $w < 40;
+      while (defined(my $line = <STDIN>)) {
+        chomp $line;
+        $line =~ s/```/`\x{200b}``/g;
+        while (length($line) > $w) {
+          print substr($line, 0, $w), "\n";
+          $line = substr($line, $w);
+        }
+        print $line;
+        print "\n" unless eof(STDIN);
+      }
+    '
+}
+
 terminal_card_json() {
   local state="$1"
   local output="$2"
@@ -875,7 +1018,7 @@ terminal_card_json() {
   cwd="$(short_path "${CHAT_WORKDIR:-$CODEX_WORKDIR}")"
   queue="$(queue_count)"
   prompt_short="$(printf '%s' "$prompt" | compact_text 260)"
-  output_text="$(printf '%s' "$output" | terminal_safe_fence_text)"
+  output_text="$(truncate_reply_text "$output" "$CARD_BODY_LIMIT_CHARS" | terminal_mobile_code_text)"
   if [[ -z "$output_text" ]]; then
     case "$state" in
       QUEUED) output_text="queued: $prompt_short" ;;
@@ -887,12 +1030,14 @@ terminal_card_json() {
   fi
 
   body=$(
-    printf '```text\n%s\n```\n\n' "$output_text"
-    printf '`%s` elapsed %ss | queue %s | session %s | cwd %s\n' \
-      "$state" "$elapsed_seconds" "$queue" "$session_label" "$cwd"
+    printf '```text\n%s\n```' "$output_text"
   )
 
   detail=$(
+    printf '**state**：%s\n' "$state"
+    printf '**elapsed**：%ss\n' "$elapsed_seconds"
+    printf '**session**：%s\n' "$session_label"
+    printf '**cwd**：%s\n' "$cwd"
     [[ -n "$prompt_short" ]] && printf '**prompt**：%s\n' "$prompt_short"
     [[ -n "$task_id" ]] && printf '**task_id**：%s\n' "$task_id"
     [[ -n "$job_id" ]] && printf '**job_id**：%s\n' "$job_id"
@@ -2191,11 +2336,7 @@ switch_session_ref() {
   else
     body="$label"
   fi
-  if [[ -n "$requested_seconds" ]]; then
-    seconds="$requested_seconds"
-  else
-    seconds="$(sync_remaining_seconds || true)"
-  fi
+  seconds="$requested_seconds"
 
   set_active_session "$session_id"
   if [[ -d "$SYNC_LOCK_DIR" ]]; then
@@ -2206,9 +2347,10 @@ switch_session_ref() {
     reply_notice "$message_id" "✅ 已常驻" "green" "$body" "同步流已切换。发送 停止同步 可结束同步。" "✅ 已常驻: $label"$'\n'"同步流已切换。"
   elif [[ -n "$seconds" ]]; then
     start_sync "$message_id" "$seconds" "$session_id"
-  else
-    reply_notice "$message_id" "✅ 已常驻" "green" "$body" "普通消息会进入这个会话；发送 清除会话 可取消。" "✅ 已常驻: $label"
+    return
   fi
+
+  reply_notice "$message_id" "✅ 已常驻" "green" "$body" "普通消息会进入这个会话；发送 清除会话 可取消。" "✅ 已常驻: $label"
 }
 
 current_session_text() {
@@ -3131,75 +3273,94 @@ while true; do
   prompt="$(normalize_prompt "$prompt")"
   ack_message "$message_id" || true
 
+  raw_prompt="$prompt"
+  slash_prompt=""
+  has_slash_cmd="false"
+  handle_commands="true"
+  if slash_prompt="$(slash_command_line "$prompt" 2>/dev/null)"; then
+    prompt="$slash_prompt"
+    has_slash_cmd="true"
+  fi
+  if [[ "$COMMAND_MODE" == "slash" && "$has_slash_cmd" != "true" ]]; then
+    handle_commands="false"
+    prompt="$raw_prompt"
+  fi
+
   if [[ -z "$prompt" ]]; then
     reply "$message_id" "收到。直接发送要我处理的内容即可。发送 目录 查看会话编号，help 查看命令。"
     continue
   fi
 
-  case "$prompt" in
-    status|状态)
-      reply_status "$message_id"
-      continue
-      ;;
-    logs|日志)
-      reply_notice "$message_id" "Logs" "blue" "$(logs_text)" "命令：status / 目录 / 队列" "$(logs_text)"
-      continue
-      ;;
-    queue|队列)
-      reply_notice "$message_id" "Queue" "blue" "$(queue_text)" "命令：status / logs" "$(queue_text)"
-      continue
-      ;;
-    help|帮助)
-      reply_notice "$message_id" "terminal help" "blue" "sessions\ncurrent\nattach 1\ndetach\nnew <prompt>\nnew session <prompt>\ncontinue\ntask / tasks\nqueue\nlogs\npwd\ncd /path\n\n普通消息默认进入当前会话；没有当前会话时创建新 terminal task。" "中文命令仍兼容：目录 / 切换 N / 清除会话 / 新会话 / 继续任务 / 队列" "sessions / current / attach 1 / detach / new <prompt> / continue / task / queue / logs / pwd / cd"
-      continue
-      ;;
-    目录|会话目录|sessions|"session list")
-      reply_directory "$message_id"
-      continue
-      ;;
-  esac
+  if [[ "$handle_commands" == "true" ]]; then
+    case "$prompt" in
+      status|状态)
+        reply_status "$message_id"
+        continue
+        ;;
+      logs|日志)
+        reply_notice "$message_id" "Logs" "blue" "$(logs_text)" "命令：status / 目录 / 队列" "$(logs_text)"
+        continue
+        ;;
+      queue|队列)
+        reply_notice "$message_id" "Queue" "blue" "$(queue_text)" "命令：status / logs" "$(queue_text)"
+        continue
+        ;;
+      help|帮助)
+        if [[ "$COMMAND_MODE" == "slash" ]]; then
+          reply_notice "$message_id" "terminal help" "blue" "/sessions\n/current\n/attach 1\n/detach\n/new <prompt>\n/new session <prompt>\n/continue\n/task / /tasks\n/queue\n/logs\n/pwd\n/cd /path\n\n普通消息默认进入当前会话；没有当前会话时创建新 terminal task。" "中文命令仍兼容：/目录 / /切换 N / /清除会话 / /新会话 / /继续任务 / /队列" "/sessions / /current / /attach 1 / /detach / /new <prompt> / /continue / /task / /queue / /logs / /pwd / /cd"
+        else
+          reply_notice "$message_id" "terminal help" "blue" "sessions\ncurrent\nattach 1\ndetach\nnew <prompt>\nnew session <prompt>\ncontinue\ntask / tasks\nqueue\nlogs\npwd\ncd /path\n\n普通消息默认进入当前会话；没有当前会话时创建新 terminal task。" "中文命令仍兼容：目录 / 切换 N / 清除会话 / 新会话 / 继续任务 / 队列" "sessions / current / attach 1 / detach / new <prompt> / continue / task / queue / logs / pwd / cd"
+        fi
+        continue
+        ;;
+      目录|会话目录|sessions|"session list")
+        reply_directory "$message_id"
+        continue
+        ;;
+    esac
+  fi
 
-  if [[ "$prompt" =~ ^(logs|日志)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(logs|日志)[[:space:]]+(.+)$ ]]; then
     reply_notice "$message_id" "Logs" "blue" "$(logs_text_for_job_ref "${BASH_REMATCH[2]}")" "命令：task <job_id> / tasks / logs" "$(logs_text_for_job_ref "${BASH_REMATCH[2]}")"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(当前会话|current)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(当前会话|current)$ ]]; then
     reply_current_session "$message_id"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(清除会话|取消会话|detach)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(清除会话|取消会话|detach)$ ]]; then
     detach_active_session "$message_id"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(pwd)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(pwd)$ ]]; then
     reply_pwd "$message_id"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(cd|cwd)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(cd|cwd)[[:space:]]+(.+)$ ]]; then
     cmd_cd "$message_id" "${BASH_REMATCH[2]}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^debug([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^debug([[:space:]]+(.+))?$ ]]; then
     cmd_debug "$message_id" "${BASH_REMATCH[2]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(syncmode|同步模式)[[:space:]]+([^[:space:]]+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(syncmode|同步模式)[[:space:]]+([^[:space:]]+)$ ]]; then
     cmd_syncmode "$message_id" "${BASH_REMATCH[2]}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(update|更新)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(update|更新)([[:space:]]+(.+))?$ ]]; then
     cmd_update_mode "$message_id" "${BASH_REMATCH[3]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(tasks|jobs)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(tasks|jobs)([[:space:]]+(.+))?$ ]]; then
     if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
       reply_job_status "$message_id" "${BASH_REMATCH[3]}"
     else
@@ -3208,61 +3369,61 @@ while true; do
     continue
   fi
 
-  if [[ "$prompt" =~ ^(任务|task|job)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(任务|task|job)([[:space:]]+(.+))?$ ]]; then
     reply_job_status "$message_id" "${BASH_REMATCH[3]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(继续任务|继续做任务|继续长任务|continue[[:space:]]+task|resume[[:space:]]+task|continue|resume)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(继续任务|继续做任务|继续长任务|continue[[:space:]]+task|resume[[:space:]]+task|continue|resume)([[:space:]]+(.+))?$ ]]; then
     continue_long_task "$message_id" "${BASH_REMATCH[3]:-}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(长任务|long[[:space:]]+task|long)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(长任务|long[[:space:]]+task|long)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     start_long_task "$message_id" "$prompt"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(新会话|新对话|new[[:space:]]+session|new[[:space:]]+chat)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(新会话|新对话|new[[:space:]]+session|new[[:space:]]+chat)$ ]]; then
     set_new_session_pending
     reply_notice "$message_id" "新会话" "blue" "已准备创建新会话。下一条普通消息会创建并常驻到这个新会话。" "命令：清除会话 可取消当前常驻；切换 N 可切到已有会话。" "已准备创建新会话。下一条普通消息会创建并常驻到这个新会话。"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(新会话|新对话)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(新会话|新对话)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     start_new_session_task "$message_id" "$prompt"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(new[[:space:]]+session|new[[:space:]]+chat)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(new[[:space:]]+session|new[[:space:]]+chat)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     start_new_session_task "$message_id" "$prompt"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(会话|session)[[:space:]]+([^[:space:]]+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(会话|session)[[:space:]]+([^[:space:]]+)$ ]]; then
     reply_notice "$message_id" "会话进度" "blue" "$(session_summary_text "${BASH_REMATCH[2]}")" "命令：切换 N / sync session N [10分钟]" "$(session_summary_text "${BASH_REMATCH[2]}")"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(置顶|pin)[[:space:]]+([^[:space:]]+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(置顶|pin)[[:space:]]+([^[:space:]]+)$ ]]; then
     pin_session_ref "$message_id" "${BASH_REMATCH[2]}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(取消置顶|unpin)[[:space:]]+([^[:space:]]+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(取消置顶|unpin)[[:space:]]+([^[:space:]]+)$ ]]; then
     unpin_session_ref "$message_id" "${BASH_REMATCH[2]}"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(停止同步|stop[[:space:]]+sync|sync[[:space:]]+stop)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(停止同步|stop[[:space:]]+sync|sync[[:space:]]+stop)$ ]]; then
     stop_sync "$message_id"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(切换会话|切换到|切换|switch|attach|常驻会话|常驻|stick|persist)[[:space:]]*([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(切换会话|切换到|切换|switch|attach|常驻会话|常驻|stick|persist)[[:space:]]*([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
     session_ref="${BASH_REMATCH[2]}"
     duration_text="${BASH_REMATCH[4]:-}"
     if [[ -n "$duration_text" ]]; then
@@ -3278,7 +3439,7 @@ while true; do
     continue
   fi
 
-  if [[ "$prompt" =~ ^(同步会话|sync[[:space:]]+session)[[:space:]]+([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(同步会话|sync[[:space:]]+session)[[:space:]]+([^[:space:]]+)([[:space:]]+(.+))?$ ]]; then
     session_ref="${BASH_REMATCH[2]}"
     duration_text="${BASH_REMATCH[4]:-}"
     session_id="$(resolve_session_ref "$session_ref" || true)"
@@ -3295,7 +3456,7 @@ while true; do
     continue
   fi
 
-  if [[ "$prompt" =~ ^同步[[:space:]]+([^[:space:]]+)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^同步[[:space:]]+([^[:space:]]+)[[:space:]]+(.+)$ ]]; then
     session_ref="${BASH_REMATCH[1]}"
     duration_text="${BASH_REMATCH[2]}"
     session_id="$(resolve_session_ref "$session_ref" || true)"
@@ -3310,12 +3471,12 @@ while true; do
     fi
   fi
 
-  if sync_seconds="$(parse_sync_seconds "$prompt")"; then
+  if [[ "$handle_commands" == "true" ]] && sync_seconds="$(parse_sync_seconds "$prompt")"; then
     start_sync "$message_id" "$sync_seconds"
     continue
   fi
 
-  if [[ "$prompt" =~ ^(新任务|new)[[:space:]]+(.+)$ ]]; then
+  if [[ "$handle_commands" == "true" && "$prompt" =~ ^(新任务|new)[[:space:]]+(.+)$ ]]; then
     prompt="${BASH_REMATCH[2]}"
     clear_new_session_pending
     if [[ "$TASK_MODE" == "auto-long" ]]; then
